@@ -194,10 +194,6 @@ export class SimulatorApi {
   moqDirectInfo(udid: string): Promise<MoqInfo> {
     return requestJson(this.transport, `${devicePath(udid)}/moq/direct`);
   }
-
-  webrtcOffer<T = unknown>(udid: string, offer: unknown): Promise<T> {
-    return requestJson(this.transport, `${devicePath(udid)}/webrtc/offer`, jsonBody(offer));
-  }
 }
 
 function devicePath(udid: string): string {
