@@ -1,0 +1,65 @@
+{
+  "name": "@swmansion/sim-client",
+  "version": "0.1.0",
+  "description": "Client library for the sim-orchestrator stack: typed sim-router HTTP API plus MoQ device streaming and input.",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "dist",
+    "proto"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./video": {
+      "types": "./dist/video.d.ts",
+      "import": "./dist/video.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js",
+      "require": "./dist/node.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@moq/net": "^0.1.7",
+    "@moq/watch": "^0.2.19",
+    "ws": "*"
+  },
+  "peerDependenciesMeta": {
+    "@moq/watch": {
+      "optional": true
+    },
+    "@fails-components/webtransport": {
+      "optional": true
+    },
+    "ws": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@moq/net": "^0.1.7",
+    "@moq/watch": "^0.2.19",
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
+    "protobufjs": "^7.4.0",
+    "tsup": "^8.3.5",
+    "typescript": "~5.8.3",
+    "vitest": "^2.1.8",
+    "ws": "^8.21.1"
+  }
+}
