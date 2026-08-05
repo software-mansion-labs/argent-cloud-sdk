@@ -1,20 +1,43 @@
-import { Broadcast, Connection, Path, type Track } from "@moq/net";
+import { Broadcast, Connection, Path, type Group, type Track } from "@moq/net";
 
 import {
   encodeInput,
+  encodeTouchState,
   type ButtonName,
   type InputMessage,
   type KeyActionName,
   type RotationName,
   type TouchActionName,
+  type TouchPointer,
 } from "../proto/encoder.js";
+import { diffTouchStates } from "../proto/touch-state.js";
 import { ScreenshotChannel, type ScreenshotOptions } from "./screenshot.js";
 
 /** The broadcast simulator-server publishes: catalog, video and screenshot tracks. */
 export const SERVER_BROADCAST = "simulator";
-/** The track name the server subscribes to on a client-published broadcast. */
+/** One-shot commands (button, rotate, wheel, screenshot, legacy touch/key). */
 export const CONTROL_TRACK = "control";
 const SCREENSHOT_TRACK = "screenshot";
+/**
+ * Keyboard events. A single long-lived group, so frames ride one ordered,
+ * reliable QUIC stream: no reordering and no latest-wins drops — a lost
+ * keyDown/keyUp would otherwise mean a missing character or a stuck key.
+ */
+export const KEYS_TRACK = "keys";
+/**
+ * Touch state snapshots (`TouchStateCommand`), one group per frame. Latest-wins
+ * drops are correct here by design: the server diffs consecutive snapshots, so
+ * only the newest state matters.
+ */
+export const TOUCH_TRACK = "touch";
+
+/**
+ * How long after the server has subscribed to the control track we keep
+ * waiting for it to also subscribe the keys/touch tracks. A server predating
+ * the split subscribes only "control"; past this grace period we fall back to
+ * legacy per-event control frames for keys and touch.
+ */
+const TRACK_FALLBACK_GRACE_MS = 2000;
 
 export interface MoqDeviceSessionOptions {
   /**
@@ -43,8 +66,18 @@ export class MoqDeviceSession {
   private readonly controlBroadcast = new Broadcast();
   private readonly serverBroadcast: Broadcast;
   private screenshots: ScreenshotChannel | null = null;
-  private controlTrack: Promise<Track> | null = null;
   private disposed = false;
+
+  /** Tracks the server has subscribed on our broadcast, filled as requests arrive. */
+  private readonly requestedTracks = new Map<string, Track>();
+  private trackWaiters = new Map<string, ((track: Track | null) => void)[]>();
+  private requestPumpDone = false;
+
+  private controlTrack: Promise<Track> | null = null;
+  private keysGroup: Promise<Group | null> | null = null;
+  private touchTrack: Promise<Track | null> | null = null;
+  /** Last snapshot applied through the legacy fallback, for diffing. */
+  private legacyTouchApplied: TouchPointer[] = [];
 
   constructor(connection: Connection.Established, options: MoqDeviceSessionOptions = {}) {
     this.connection = connection;
@@ -52,6 +85,7 @@ export class MoqDeviceSession {
 
     this.serverBroadcast = connection.consume(Path.from(SERVER_BROADCAST));
     connection.publish(Path.from(options.publishPath ?? "input"), this.controlBroadcast);
+    void this.pumpTrackRequests();
 
     void this.closed.then(
       () => this.screenshots?.close(new Error("MoQ connection closed")),
@@ -60,23 +94,63 @@ export class MoqDeviceSession {
     );
   }
 
-  /** Sends one already-encoded `DataChannelCommand` frame. */
+  /** Sends one already-encoded `DataChannelCommand` frame on the control track. */
   async sendControl(payload: Uint8Array): Promise<void> {
     const track = await this.resolveControlTrack();
     track.writeFrame(payload);
   }
 
-  /** Encodes and sends an input event. */
+  /** Encodes and sends an input event on the track appropriate for its type. */
   sendInput(message: InputMessage): Promise<void> {
-    return this.sendControl(encodeInput(message));
+    switch (message.type) {
+      case "touchState":
+        return this.touchState(message.pointers);
+      case "key":
+        return this.key(message.action, message.code);
+      default:
+        return this.sendControl(encodeInput(message));
+    }
   }
 
+  /**
+   * Sends a full snapshot of the active touch pointers. Prefer this over
+   * `touch`: snapshots ride the latest-wins "touch" track, where a dropped
+   * intermediate frame cannot lose a down/up transition.
+   */
+  async touchState(pointers: TouchPointer[]): Promise<void> {
+    const track = await this.resolveTouchTrack();
+    if (track) {
+      track.writeFrame(encodeTouchState(pointers));
+      return;
+    }
+    // Server predates the touch track: convert the snapshot into legacy
+    // per-event touch frames on the control track.
+    const { events, applied } = diffTouchStates(this.legacyTouchApplied, pointers);
+    this.legacyTouchApplied = applied;
+    for (const message of events) {
+      await this.sendControl(encodeInput(message));
+    }
+  }
+
+  /** @deprecated Use `touchState`; per-event touch frames can be dropped in transit. */
   touch(action: TouchActionName, x: number, y: number, secondX?: number, secondY?: number): Promise<void> {
-    return this.sendInput({ type: "touch", action, x, y, secondX, secondY });
+    return this.sendControl(
+      encodeInput({ type: "touch", action, x, y, secondX, secondY }),
+    );
   }
 
-  key(action: KeyActionName, code: number): Promise<void> {
-    return this.sendInput({ type: "key", action, code });
+  /**
+   * Sends a key event on the reliable, ordered "keys" track. Falls back to a
+   * legacy control-track frame against servers that predate the track split.
+   */
+  async key(action: KeyActionName, code: number): Promise<void> {
+    const payload = encodeInput({ type: "key", action, code });
+    const group = await this.resolveKeysGroup();
+    if (group) {
+      group.writeFrame(payload);
+    } else {
+      await this.sendControl(payload);
+    }
   }
 
   button(action: KeyActionName, button: ButtonName): Promise<void> {
@@ -132,22 +206,95 @@ export class MoqDeviceSession {
   }
 
   /**
+   * Collects every track the server subscribes on our broadcast. The server
+   * subscribes "control" plus (if it speaks the split protocol) "keys" and
+   * "touch" when it sees the announcement, so requests arrive together, but in
+   * no guaranteed order.
+   */
+  private async pumpTrackRequests(): Promise<void> {
+    try {
+      for (;;) {
+        const request = await this.controlBroadcast.requested();
+        if (!request) break;
+        const { track } = request;
+        this.requestedTracks.set(track.name, track);
+        const waiters = this.trackWaiters.get(track.name);
+        if (waiters) {
+          this.trackWaiters.delete(track.name);
+          for (const resolve of waiters) resolve(track);
+        }
+      }
+    } catch {
+      /* broadcast closed — fall through to waiter cleanup */
+    }
+    this.requestPumpDone = true;
+    const pending = this.trackWaiters;
+    this.trackWaiters = new Map();
+    for (const waiters of pending.values()) {
+      for (const resolve of waiters) resolve(null);
+    }
+  }
+
+  /** Resolves once the server subscribes `name`; null if the broadcast closes first. */
+  private waitForTrack(name: string): Promise<Track | null> {
+    const track = this.requestedTracks.get(name);
+    if (track) return Promise.resolve(track);
+    if (this.requestPumpDone) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const waiters = this.trackWaiters.get(name) ?? [];
+      waiters.push(resolve);
+      this.trackWaiters.set(name, waiters);
+    });
+  }
+
+  /**
+   * Resolves `name` once the server subscribes it, giving up
+   * `TRACK_FALLBACK_GRACE_MS` after the control track was subscribed — a server
+   * that speaks the split protocol subscribes all tracks together, so waiting
+   * longer only means it never will. Null means "fall back to control".
+   */
+  private waitForOptionalTrack(name: string): Promise<Track | null> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (track: Track | null) => {
+        if (!settled) {
+          settled = true;
+          resolve(track);
+        }
+      };
+      void this.waitForTrack(name).then(settle);
+      void this.resolveControlTrack().then(
+        () => setTimeout(() => settle(this.requestedTracks.get(name) ?? null), TRACK_FALLBACK_GRACE_MS),
+        () => settle(null),
+      );
+    });
+  }
+
+  /**
    * The server subscribes to our control track once it sees the announcement,
    * so the first send may have to wait for it. Cache the resolved track so
    * every later send is immediate.
    */
   private resolveControlTrack(): Promise<Track> {
-    if (this.controlTrack) return this.controlTrack;
-    this.controlTrack = (async () => {
-      for (;;) {
-        const request = await this.controlBroadcast.requested();
-        if (!request) {
-          throw new Error("MoQ control broadcast closed before the server subscribed");
-        }
-        // Ignore anything else the server might ask for in the future.
-        if (request.track.name === CONTROL_TRACK) return request.track;
+    this.controlTrack ??= this.waitForTrack(CONTROL_TRACK).then((track) => {
+      if (!track) {
+        throw new Error("MoQ control broadcast closed before the server subscribed");
       }
-    })();
+      return track;
+    });
     return this.controlTrack;
+  }
+
+  /** The single ordered group all key events ride on; null → legacy fallback. */
+  private resolveKeysGroup(): Promise<Group | null> {
+    this.keysGroup ??= this.waitForOptionalTrack(KEYS_TRACK).then(
+      (track) => track?.appendGroup() ?? null,
+    );
+    return this.keysGroup;
+  }
+
+  private resolveTouchTrack(): Promise<Track | null> {
+    this.touchTrack ??= this.waitForOptionalTrack(TOUCH_TRACK);
+    return this.touchTrack;
   }
 }

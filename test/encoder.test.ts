@@ -10,6 +10,7 @@ import {
   encodeRotate,
   encodeScreenshot,
   encodeTouch,
+  encodeTouchState,
   encodeWheel,
   type InputMessage,
 } from "../src/proto/encoder.js";
@@ -60,6 +61,35 @@ describe("touch", () => {
     expectSameBytes(
       encodeTouch({ action: "Down", x: 0.1, y: 0.1, secondX: undefined }),
       reference({ touch: { action: 0, x: 0.1, y: 0.1 } }),
+    );
+  });
+});
+
+describe("touchState", () => {
+  it("encodes an empty snapshot (all pointers lifted)", () => {
+    expectSameBytes(encodeTouchState([]), reference({ touchState: {} }));
+  });
+
+  it("encodes a single pointer, including explicit zero values", () => {
+    expectSameBytes(
+      encodeTouchState([{ id: 0, x: 0, y: 0 }]),
+      reference({ touchState: { pointers: [{ id: 0, x: 0, y: 0 }] } }),
+    );
+  });
+
+  it("encodes multiple pointers in order", () => {
+    const pointers = [
+      { id: 1, x: 0.25, y: 0.75 },
+      { id: 2, x: 0.5, y: 0.5 },
+      { id: 7, x: 1, y: 0 },
+    ];
+    expectSameBytes(encodeTouchState(pointers), reference({ touchState: { pointers } }));
+  });
+
+  it("sign-extends a negative pointer id", () => {
+    expectSameBytes(
+      encodeTouchState([{ id: -1, x: 0.1, y: 0.2 }]),
+      reference({ touchState: { pointers: [{ id: -1, x: 0.1, y: 0.2 }] } }),
     );
   });
 });

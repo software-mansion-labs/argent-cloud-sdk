@@ -33,6 +33,7 @@ export {
   encodeRotate,
   encodeScreenshot,
   encodeTouch,
+  encodeTouchState,
   encodeWheel,
   type ButtonName,
   type DownscalerName,
@@ -40,7 +41,9 @@ export {
   type KeyActionName,
   type RotationName,
   type TouchActionName,
+  type TouchPointer,
 } from "./proto/encoder.js";
+export { diffTouchStates } from "./proto/touch-state.js";
 
 export { connectMoq, unwrapMoqConnectError, type ConnectOptions } from "./moq/connect.js";
 export { decodeHexFingerprint } from "./moq/fingerprint.js";
@@ -52,8 +55,10 @@ export {
 } from "./moq/fallback.js";
 export {
   CONTROL_TRACK,
+  KEYS_TRACK,
   MoqDeviceSession,
   SERVER_BROADCAST,
+  TOUCH_TRACK,
   type MoqDeviceSessionOptions,
 } from "./moq/session.js";
 export { ScreenshotChannel, type ScreenshotOptions } from "./moq/screenshot.js";

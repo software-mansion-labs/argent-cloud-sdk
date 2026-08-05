@@ -35,39 +35,61 @@ function fakeConnection() {
 }
 
 interface FakeBroadcast {
-  requested(): Promise<{ track: { name: string; writeFrame(f: Uint8Array): void } } | undefined>;
+  requested(): Promise<{ track: FakeTrack } | undefined>;
   close(): void;
+}
+
+/** A track the fake server has subscribed on the session's broadcast. */
+class FakeTrack {
+  readonly frames: Uint8Array[] = [];
+  readonly groups: { frames: Uint8Array[]; writeFrame(f: Uint8Array): void }[] = [];
+
+  constructor(
+    readonly name: string,
+    private readonly all: Uint8Array[],
+  ) {}
+
+  writeFrame(f: Uint8Array) {
+    this.frames.push(f);
+    this.all.push(f);
+  }
+
+  appendGroup() {
+    const frames: Uint8Array[] = [];
+    const group = { frames, writeFrame: (f: Uint8Array) => frames.push(f) };
+    this.groups.push(group);
+    return group;
+  }
 }
 
 /** Replaces the Broadcast the session constructs for its control track. */
 class FakeControlBroadcast implements FakeBroadcast {
+  /** Frames written to any track, in send order (legacy assertions). */
   readonly frames: Uint8Array[] = [];
   closed = false;
-  private requests: { track: { name: string; writeFrame(f: Uint8Array): void } }[] = [];
-  private waiter: ((r: { track: { name: string; writeFrame(f: Uint8Array): void } } | undefined) => void) | null = null;
+  private requests: { track: FakeTrack }[] = [];
+  private waiter: ((r: { track: FakeTrack } | undefined) => void) | null = null;
 
   requested() {
     const next = this.requests.shift();
     if (next) return Promise.resolve(next);
-    return new Promise<{ track: { name: string; writeFrame(f: Uint8Array): void } } | undefined>(
-      (resolve) => {
-        this.waiter = resolve;
-      },
-    );
+    return new Promise<{ track: FakeTrack } | undefined>((resolve) => {
+      this.waiter = resolve;
+    });
   }
 
   /** Simulates the server subscribing to a track on our broadcast. */
-  serverSubscribes(name: string) {
-    const request = {
-      track: { name, writeFrame: (f: Uint8Array) => this.frames.push(f) },
-    };
+  serverSubscribes(name: string): FakeTrack {
+    const track = new FakeTrack(name, this.frames);
+    const request = { track };
     const waiter = this.waiter;
     if (waiter) {
       this.waiter = null;
       waiter(request);
-      return;
+    } else {
+      this.requests.push(request);
     }
-    this.requests.push(request);
+    return track;
   }
 
   close() {
@@ -178,5 +200,82 @@ describe("MoqDeviceSession", () => {
     closeConnection();
 
     await expect(pending).rejects.toThrow(/connection closed/i);
+  });
+
+  it("sends all key events as frames of one group on the keys track", async () => {
+    const { session, control } = newSession();
+
+    const first = session.key("Down", 0x04);
+    control.serverSubscribes("control");
+    const keys = control.serverSubscribes("keys");
+    await first;
+    await session.key("Up", 0x04);
+    await session.key("Down", 0x05);
+
+    expect(keys.groups).toHaveLength(1);
+    expect(keys.groups[0]?.frames).toHaveLength(3);
+    expect(control.serverSubscribes("control").frames).toHaveLength(0);
+  });
+
+  it("falls back to control-track key frames when the server never subscribes 'keys'", async () => {
+    vi.useFakeTimers();
+    try {
+      const { session, control } = newSession();
+
+      const sent = session.key("Down", 0x04);
+      const controlTrack = control.serverSubscribes("control");
+      await vi.advanceTimersByTimeAsync(2500);
+      await sent;
+
+      expect(controlTrack.frames).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sends touch snapshots as individual frames on the touch track", async () => {
+    const { session, control } = newSession();
+
+    const first = session.touchState([{ id: 1, x: 0.5, y: 0.5 }]);
+    control.serverSubscribes("control");
+    const touch = control.serverSubscribes("touch");
+    await first;
+    await session.touchState([]);
+
+    expect(touch.frames).toHaveLength(2);
+    expect(touch.groups).toHaveLength(0);
+  });
+
+  it("converts touch snapshots to legacy events when the server never subscribes 'touch'", async () => {
+    vi.useFakeTimers();
+    try {
+      const { session, control } = newSession();
+
+      const sent = session.touchState([{ id: 1, x: 0.5, y: 0.5 }]);
+      const controlTrack = control.serverSubscribes("control");
+      await vi.advanceTimersByTimeAsync(2500);
+      await sent;
+      await session.touchState([{ id: 1, x: 0.6, y: 0.6 }]);
+      await session.touchState([]);
+
+      // Down, Move, Up as three legacy control frames.
+      expect(controlTrack.frames).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("routes touchState and key InputMessages through sendInput", async () => {
+    const { session, control } = newSession();
+
+    const first = session.sendInput({ type: "key", action: "Down", code: 0x04 });
+    control.serverSubscribes("control");
+    const keys = control.serverSubscribes("keys");
+    const touch = control.serverSubscribes("touch");
+    await first;
+    await session.sendInput({ type: "touchState", pointers: [{ id: 0, x: 0.1, y: 0.2 }] });
+
+    expect(keys.groups[0]?.frames).toHaveLength(1);
+    expect(touch.frames).toHaveLength(1);
   });
 });

@@ -139,6 +139,32 @@ export function encodeTouch(opts: {
   return wrap(1, inner);
 }
 
+export interface TouchPointer {
+  /** Stable identifier for the pointer while it stays down (e.g. Touch.identifier). */
+  id: number;
+  x: number;
+  y: number;
+}
+
+/**
+ * Snapshot of all currently-active touch pointers. Downs/ups are implicit in
+ * pointers entering/leaving the list, so frames are safe to drop in transit —
+ * the receiver diffs consecutive snapshots (latest wins).
+ */
+export function encodeTouchState(pointers: readonly TouchPointer[]): Uint8Array {
+  const inner: number[] = [];
+  for (const pointer of pointers) {
+    const msg: number[] = [];
+    int32(msg, 1, pointer.id);
+    double(msg, 2, pointer.x);
+    double(msg, 3, pointer.y);
+    tag(inner, 1, WIRE_LEN);
+    varint(inner, msg.length);
+    inner.push(...msg);
+  }
+  return wrap(7, inner);
+}
+
 export function encodeKey(opts: { action: KeyActionName; code: number }): Uint8Array {
   const inner: number[] = [];
   enumField(inner, 1, KEY_ACTION[opts.action]);
@@ -191,6 +217,7 @@ export function encodeScreenshot(opts?: {
  */
 export type InputMessage =
   | { type: "touch"; action: TouchActionName; x: number; y: number; secondX?: number; secondY?: number }
+  | { type: "touchState"; pointers: TouchPointer[] }
   | { type: "key"; action: KeyActionName; code: number }
   | { type: "button"; action: KeyActionName; button: ButtonName }
   | { type: "rotate"; direction: RotationName }
@@ -201,6 +228,8 @@ export function encodeInput(msg: InputMessage): Uint8Array {
   switch (msg.type) {
     case "touch":
       return encodeTouch(msg);
+    case "touchState":
+      return encodeTouchState(msg.pointers);
     case "key":
       return encodeKey(msg);
     case "button":

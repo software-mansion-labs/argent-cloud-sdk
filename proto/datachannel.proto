@@ -81,6 +81,20 @@ message ScreenshotCommand {
   optional DownscalerType downscaler = 4;
 }
 
+message TouchPointer {
+  int32 id = 1;
+  double x = 2;
+  double y = 3;
+}
+
+// Full snapshot of the currently-active touch pointers. Downs and ups are
+// implicit: a pointer appearing in the list means it is touching, disappearing
+// means it lifted. The receiver diffs consecutive snapshots, so intermediate
+// snapshots may be dropped in transit (latest-wins) without corrupting state.
+message TouchStateCommand {
+  repeated TouchPointer pointers = 1;
+}
+
 message DataChannelCommand {
   oneof command {
     TouchCommand touch = 1;
@@ -89,5 +103,6 @@ message DataChannelCommand {
     RotateCommand rotate = 4;
     WheelCommand wheel = 5;
     ScreenshotCommand screenshot = 6;
+    TouchStateCommand touch_state = 7;
   }
 }
