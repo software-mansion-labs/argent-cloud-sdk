@@ -14,36 +14,73 @@ interface Pending {
   reject: (error: Error) => void;
 }
 
+/** How long to wait for a response before giving up on a request. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
 /**
  * Request/response channel layered over the MoQ control and "screenshot"
  * tracks: the request goes out as a `ScreenshotCommand` carrying an id, and the
  * server echoes that id back on the shared screenshot track alongside the
  * base64 image.
  *
- * Responses are matched by id, so concurrent callers can't steal each other's
- * frames. A server too old to echo the id still works — an id-less frame is
- * handed to the oldest waiter, which is correct because the server answers in
- * the order it receives requests.
+ * Requests are issued one at a time — see `request` for why. The echoed id is
+ * still matched, so a late or duplicate frame can't be handed to the wrong
+ * waiter; a server too old to echo it goes to the oldest waiter instead, which
+ * is correct given requests are answered in order.
  */
 export class ScreenshotChannel {
   private readonly pending: Pending[] = [];
   private nextId = 0;
   private reading = false;
   private closed = false;
+  /** Why the channel closed, so queued requests fail for the same reason. */
+  private closeReason: Error | null = null;
+  /** Tail of the request queue; see `request`. */
+  private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly track: Track,
     private readonly sendControl: (payload: Uint8Array) => Promise<void>,
+    private readonly timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
   ) {}
 
+  /**
+   * Requests one screenshot.
+   *
+   * Requests are issued one at a time. simulator-server answers a single
+   * screenshot per session at a time — send it a second request before the
+   * first is answered and only one response comes back, so an unserialised
+   * caller waits forever. Queuing here keeps concurrent callers correct, and
+   * the id on each request still guards against a stale frame being handed to
+   * the wrong waiter.
+   */
   request(options: ScreenshotOptions = {}): Promise<Uint8Array> {
     if (this.closed) {
-      return Promise.reject(new Error("MoQ screenshot channel is closed"));
+      return Promise.reject(this.closedError());
+    }
+    const run = () => this.send(options);
+    const result = this.queue.then(run, run);
+    // Keep the queue advancing even when a request fails.
+    this.queue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private send(options: ScreenshotOptions): Promise<Uint8Array> {
+    if (this.closed) {
+      return Promise.reject(this.closedError());
     }
 
     const id = String(++this.nextId);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const result = new Promise<Uint8Array>((resolve, reject) => {
       this.pending.push({ id, resolve, reject });
+      // A dropped response must surface as an error, not an unresolved promise.
+      timer = setTimeout(() => {
+        this.settle(id, new Error(`MoQ screenshot timed out after ${this.timeoutMs}ms`));
+      }, this.timeoutMs);
     });
 
     this.startReading();
@@ -52,16 +89,23 @@ export class ScreenshotChannel {
       this.settle(id, err instanceof Error ? err : new Error(String(err)));
     });
 
-    return result;
+    return result.finally(() => {
+      if (timer) clearTimeout(timer);
+    });
   }
 
   /** Fails every in-flight request; call when the session goes away. */
   close(reason?: Error): void {
     this.closed = true;
     const error = reason ?? new Error("MoQ screenshot channel is closed");
+    this.closeReason = error;
     while (this.pending.length > 0) {
       this.pending.shift()?.reject(error);
     }
+  }
+
+  private closedError(): Error {
+    return this.closeReason ?? new Error("MoQ screenshot channel is closed");
   }
 
   private startReading(): void {

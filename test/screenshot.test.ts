@@ -73,22 +73,32 @@ describe("ScreenshotChannel", () => {
     expect(Array.from(await pending)).toEqual([1, 2, 3]);
   });
 
-  it("matches concurrent requests by id, whatever order they answer in", async () => {
+  it("issues concurrent requests one at a time", async () => {
+    // The server answers one screenshot per session at a time; a second
+    // in-flight request would never be answered. Verified against the real
+    // server — two unserialised requests hang.
     const track = new FakeTrack();
-    const channel = new ScreenshotChannel(track.asTrack(), async () => {});
+    const sent: Uint8Array[] = [];
+    const channel = new ScreenshotChannel(track.asTrack(), async (p) => {
+      sent.push(p);
+    });
 
     const first = channel.request();
     const second = channel.request();
     await flush();
 
-    track.push({ id: "2", data: base64([2, 2]) });
-    track.push({ id: "1", data: base64([1, 1]) });
+    expect(sent).toHaveLength(1);
 
+    track.push({ id: "1", data: base64([1, 1]) });
     expect(Array.from(await first)).toEqual([1, 1]);
+    await flush();
+
+    expect(sent).toHaveLength(2);
+    track.push({ id: "2", data: base64([2, 2]) });
     expect(Array.from(await second)).toEqual([2, 2]);
   });
 
-  it("hands an id-less frame to the oldest waiter, for servers that don't echo ids", async () => {
+  it("keeps the queue moving when a request fails", async () => {
     const track = new FakeTrack();
     const channel = new ScreenshotChannel(track.asTrack(), async () => {});
 
@@ -96,11 +106,30 @@ describe("ScreenshotChannel", () => {
     const second = channel.request();
     await flush();
 
-    track.push({ data: base64([10]) });
-    track.push({ data: base64([20]) });
+    track.push({ id: "1" }); // no data field -> first rejects
+    await expect(first).rejects.toThrow(/missing 'data' field/);
+    await flush();
 
-    expect(Array.from(await first)).toEqual([10]);
-    expect(Array.from(await second)).toEqual([20]);
+    track.push({ id: "2", data: base64([7]) });
+    expect(Array.from(await second)).toEqual([7]);
+  });
+
+  it("accepts an id-less frame, for servers that don't echo ids", async () => {
+    const track = new FakeTrack();
+    const channel = new ScreenshotChannel(track.asTrack(), async () => {});
+
+    const pending = channel.request();
+    await flush();
+    track.push({ data: base64([10]) });
+
+    expect(Array.from(await pending)).toEqual([10]);
+  });
+
+  it("times out instead of hanging when no response arrives", async () => {
+    const track = new FakeTrack();
+    const channel = new ScreenshotChannel(track.asTrack(), async () => {}, 40);
+
+    await expect(channel.request()).rejects.toThrow(/timed out after 40ms/);
   });
 
   it("ignores a response nobody is waiting for", async () => {

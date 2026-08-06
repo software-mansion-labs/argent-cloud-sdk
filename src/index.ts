@@ -1,5 +1,5 @@
 /**
- * Client library for the sim-orchestrator stack.
+ * Client library for the Argent Cloud device backend.
  *
  * Two layers, usable independently:
  *

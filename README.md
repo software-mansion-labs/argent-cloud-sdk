@@ -118,5 +118,5 @@ npm run build && npm pack
 Then in the argent checkout:
 
 ```bash
-npm install /path/to/radon-cloud/packages/argent-cloud-sdk/swmansion-argent-cloud-sdk-0.1.0.tgz
+npm install /path/to/argent-cloud-sdk/swmansion-argent-cloud-sdk-<version>.tgz
 ```
