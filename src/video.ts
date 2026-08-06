@@ -2,7 +2,7 @@
  * Browser-only video rendering, kept out of the main entry so Node consumers
  * never load `@moq/watch` (which needs WebCodecs and the DOM).
  *
- * Import from `@swmansion/sim-client/video`.
+ * Import from `@swmansion/argent-cloud-sdk/video`.
  */
 import { Path, type Connection } from "@moq/net";
 import { Broadcast as WatchBroadcast, Sync, Video, type Latency } from "@moq/watch";

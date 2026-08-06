@@ -1,7 +1,7 @@
 {
-  "name": "@swmansion/sim-client",
+  "name": "@swmansion/argent-cloud-sdk",
   "version": "0.1.0",
-  "description": "Client library for the sim-orchestrator stack: typed sim-router HTTP API plus MoQ device streaming and input.",
+  "description": "Client library for Argent Cloud: typed HTTP API plus MoQ device streaming and input.",
   "license": "MIT",
   "type": "module",
   "files": [

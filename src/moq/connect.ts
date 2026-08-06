@@ -15,7 +15,7 @@ export interface ConnectOptions {
 /**
  * Opens a MoQ session to the simulator-server described by `info`.
  *
- * In Node, call `installNodeWebTransport()` from `@swmansion/sim-client/node`
+ * In Node, call `installNodeWebTransport()` from `@swmansion/argent-cloud-sdk/node`
  * first — there is no built-in WebTransport there.
  */
 export async function connectMoq(info: MoqInfo, options: ConnectOptions = {}) {

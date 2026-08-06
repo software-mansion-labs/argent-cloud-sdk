@@ -56,7 +56,7 @@ export interface MoqDeviceSessionOptions {
  *
  * Retry policy lives with the caller — see `openWithDirectFallback` for opening
  * a connection and `closed` for noticing it went away. For video, pass
- * `connection` to `attachVideo` from `@swmansion/sim-client/video`.
+ * `connection` to `attachVideo` from `@swmansion/argent-cloud-sdk/video`.
  */
 export class MoqDeviceSession {
   readonly connection: Connection.Established;

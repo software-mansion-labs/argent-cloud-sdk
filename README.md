@@ -1,16 +1,16 @@
-# @swmansion/sim-client
+# @swmansion/argent-cloud-sdk
 
-Client library for the sim-orchestrator stack. It covers the two things every
-client needs — the control plane (sim-router's HTTP API) and the device plane
+Client library for Argent Cloud. It covers the two things every
+client needs — the control plane (router's HTTP API) and the device plane
 (MoQ video, input and screenshots) — so headless and interactive clients share
 one implementation instead of each keeping its own copy.
 
-Used by the radon-cloud webui and by argent.
+Used by the Argent Cloud webui and by the `@swmansion/argent` package.
 
 ## Install
 
 ```bash
-npm install @swmansion/sim-client @moq/net
+npm install @swmansion/argent-cloud-sdk @moq/net
 ```
 
 `@moq/watch` is needed only for video rendering, and `ws` +
@@ -18,12 +18,16 @@ npm install @swmansion/sim-client @moq/net
 
 ## Control plane
 
-`SimulatorApi` speaks sim-router's HTTP API. How a request is authenticated is
+`SimulatorApi` speaks router's HTTP API. How a request is authenticated is
 the transport's business, so the same class works whether you hold a session
 token yourself or sit behind a proxy that holds one for you:
 
 ```ts
-import { RouterAuthClient, SimulatorApi, makeBearerTransport } from "@swmansion/sim-client";
+import {
+  RouterAuthClient,
+  SimulatorApi,
+  makeBearerTransport,
+} from "@swmansion/argent-cloud-sdk";
 
 const auth = new RouterAuthClient(makeBearerTransport(routerUrl, undefined));
 const { token } = await auth.login(username, apiKey);
@@ -42,7 +46,11 @@ to spot a `machine_unavailable` you can wait out.
 ## Device plane
 
 ```ts
-import { MoqDeviceSession, openWithDirectFallback, createDirectFallbackState } from "@swmansion/sim-client";
+import {
+  MoqDeviceSession,
+  openWithDirectFallback,
+  createDirectFallbackState,
+} from "@swmansion/argent-cloud-sdk";
 
 const fallback = createDirectFallbackState();
 const connection = await openWithDirectFallback({
@@ -67,7 +75,7 @@ session when it settles.
 ### Video (browser)
 
 ```ts
-import { attachVideo } from "@swmansion/sim-client/video";
+import { attachVideo } from "@swmansion/argent-cloud-sdk/video";
 
 const video = attachVideo(session.connection, canvas, {
   onResize: () => relayoutOverlay(),
@@ -81,7 +89,7 @@ There is no WebTransport in Node, so install the polyfill globals once before
 the first connect:
 
 ```ts
-import { installNodeWebTransport } from "@swmansion/sim-client/node";
+import { installNodeWebTransport } from "@swmansion/argent-cloud-sdk/node";
 
 await installNodeWebTransport();
 ```
@@ -110,5 +118,5 @@ npm run build && npm pack
 Then in the argent checkout:
 
 ```bash
-npm install /path/to/radon-cloud/packages/sim-client/swmansion-sim-client-0.1.0.tgz
+npm install /path/to/radon-cloud/packages/argent-cloud-sdk/swmansion-argent-cloud-sdk-0.1.0.tgz
 ```

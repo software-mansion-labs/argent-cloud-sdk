@@ -2,7 +2,7 @@
  * Node support, kept out of the main entry so browser bundles never see `ws` or
  * the WebTransport polyfill.
  *
- * Import from `@swmansion/sim-client/node`.
+ * Import from `@swmansion/argent-cloud-sdk/node`.
  */
 
 let ready: Promise<void> | null = null;

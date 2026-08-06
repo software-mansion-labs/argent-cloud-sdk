@@ -9,8 +9,8 @@
  *    `makeProxyTransport`.
  *  - **Device plane** — `MoqDeviceSession` for streaming and input over MoQ.
  *
- * Video rendering lives in `@swmansion/sim-client/video` (browser only) and the
- * Node WebTransport polyfill in `@swmansion/sim-client/node`, so neither leaks
+ * Video rendering lives in `@swmansion/argent-cloud-sdk/video` (browser only) and the
+ * Node WebTransport polyfill in `@swmansion/argent-cloud-sdk/node`, so neither leaks
  * into environments that can't use it.
  */
 
