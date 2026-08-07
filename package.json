@@ -1,6 +1,6 @@
 {
   "name": "@swmansion/argent-cloud-sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Client library for Argent Cloud: typed HTTP API plus MoQ device streaming and input.",
   "license": "MIT",
   "repository": {
