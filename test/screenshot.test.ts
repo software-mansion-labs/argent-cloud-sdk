@@ -114,7 +114,7 @@ describe("ScreenshotChannel", () => {
     expect(Array.from(await second)).toEqual([7]);
   });
 
-  it("accepts an id-less frame, for servers that don't echo ids", async () => {
+  it("rejects a frame with no id rather than guessing a waiter", async () => {
     const track = new FakeTrack();
     const channel = new ScreenshotChannel(track.asTrack(), async () => {});
 
@@ -122,7 +122,37 @@ describe("ScreenshotChannel", () => {
     await flush();
     track.push({ data: base64([10]) });
 
-    expect(Array.from(await pending)).toEqual([10]);
+    await expect(pending).rejects.toThrow(/no string 'id'/);
+  });
+
+  it("never hands a late answer to the next request", async () => {
+    // A request that timed out must not have its answer delivered to whoever
+    // asked next: the image would look valid while showing the device as it
+    // was more than a timeout ago.
+    const track = new FakeTrack();
+    const channel = new ScreenshotChannel(track.asTrack(), async () => {}, 30);
+
+    const first = channel.request();
+    await expect(first).rejects.toThrow(/timed out/);
+
+    const second = channel.request();
+    await flush();
+
+    // The late answer to #1 arrives after #2 is already waiting.
+    track.push({ id: "1", data: base64([1, 1, 1]) });
+    await flush();
+
+    // #2 must still be waiting, not holding #1's stale image.
+    let settled = false;
+    void second.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    await flush();
+    expect(settled).toBe(false);
+
+    track.push({ id: "2", data: base64([2, 2, 2]) });
+    expect(Array.from(await second)).toEqual([2, 2, 2]);
   });
 
   it("times out instead of hanging when no response arrives", async () => {

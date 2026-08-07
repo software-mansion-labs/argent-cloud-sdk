@@ -23,10 +23,15 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
  * server echoes that id back on the shared screenshot track alongside the
  * base64 image.
  *
- * Requests are issued one at a time — see `request` for why. The echoed id is
- * still matched, so a late or duplicate frame can't be handed to the wrong
- * waiter; a server too old to echo it goes to the oldest waiter instead, which
- * is correct given requests are answered in order.
+ * Requests are issued one at a time — see `request` for why.
+ *
+ * A response is only ever delivered to the request whose id it carries. The
+ * server has echoed that id since MoQ streaming was introduced, and supplies a
+ * counter of its own when a request omits one, so the field is always present;
+ * a frame without it is an error rather than something to guess at. That
+ * matters most after a request times out — the late answer must not be handed
+ * to the next caller, who would receive a stale image with nothing marking it
+ * as such.
  */
 export class ScreenshotChannel {
   private readonly pending: Pending[] = [];
@@ -145,15 +150,25 @@ export class ScreenshotChannel {
       return;
     }
 
-    const bytes = base64ToBytes(payload.data);
-    const id = typeof payload.id === "string" ? payload.id : undefined;
-    const index = id === undefined ? 0 : this.pending.findIndex((p) => p.id === id);
-    if (index === -1) {
-      // A response nobody is waiting for — a duplicate, or the leftover answer
-      // to a request that already failed. Dropping it is the only safe move.
+    if (typeof payload.id !== "string") {
+      // simulator-server has echoed the id since MoQ streaming was introduced,
+      // and substitutes a counter when the request omits one, so the field is
+      // always a string. Guessing a waiter here — the obvious being the oldest
+      // — would hand one caller another's screenshot, which is worse than
+      // failing: the image looks perfectly valid and nothing marks it stale.
+      this.failOldest(
+        new Error(`MoQ screenshot frame has no string 'id': ${JSON.stringify(payload)}`),
+      );
       return;
     }
-    this.pending.splice(index, 1)[0]?.resolve(bytes);
+
+    const index = this.pending.findIndex((p) => p.id === payload.id);
+    if (index === -1) {
+      // A response nobody is waiting for — a duplicate, or the leftover answer
+      // to a request that already timed out. Dropping it is the only safe move.
+      return;
+    }
+    this.pending.splice(index, 1)[0]?.resolve(base64ToBytes(payload.data));
   }
 
   private settle(id: string, error: Error): void {
