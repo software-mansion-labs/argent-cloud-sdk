@@ -3,6 +3,10 @@
   "version": "0.1.1",
   "description": "Client library for Argent Cloud: typed HTTP API plus MoQ device streaming and input.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/software-mansion-labs/argent-cloud-sdk.git"
+  },
   "type": "module",
   "files": [
     "dist",
@@ -33,7 +37,7 @@
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "prepublishOnly": "npm run build"
+    "prepack": "npm run build"
   },
   "peerDependencies": {
     "@moq/net": "^0.1.7",
