@@ -1,0 +1,58 @@
+name: publish-sdk
+
+# This repository and workflow name are configured in npmjs as the trusted
+# publisher for @swmansion/argent-cloud-sdk — do not rename this file without
+# updating that trusted-publisher config.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-type:
+        description: Type of release to publish
+        type: choice
+        options: [stable, nightly, beta, alpha, rc]
+        default: stable
+      version:
+        description: Explicit version in x.y.z format (optional)
+        type: string
+        required: false
+        default: ''
+      dry-run:
+        description: Dry run — no actual publish or git push
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # checkout only; the action performs no git operations
+      id-token: write # required for OIDC / npm provenance
+
+    concurrency:
+      group: publish-sdk-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+
+      - name: Publish release
+        uses: software-mansion/npm-package-publish@bbfbcdf3f27e2dc288d7d56f5989a731efc79e6f
+        with:
+          package-name: '@swmansion/argent-cloud-sdk'
+          package-json-path: 'package.json'
+          install-dependencies-command: 'npm ci'
+          release-type: ${{ inputs.release-type }}
+          version: ${{ inputs.version }}
+          dry-run: ${{ inputs.dry-run }}
+          # The version bump is made in the PR that ships the change, so the
+          # action has nothing to commit or tag.
+          perform-git-operations: false
