@@ -5,6 +5,11 @@ name: publish-sdk
 # updating that trusted-publisher config.
 
 on:
+  # Cutting an `x.y-stable` branch publishes that release automatically. The
+  # action reads major.minor from the branch name and picks the patch by
+  # querying the registry, so `0.2-stable` publishes 0.2.0, and cutting it
+  # again later would publish 0.2.1.
+  create:
   workflow_dispatch:
     inputs:
       release-type:
@@ -26,8 +31,14 @@ jobs:
   publish:
     runs-on: ubuntu-latest
 
+    # `create` also fires for tags — including the `v<version>` tag this
+    # workflow pushes itself, which would otherwise re-trigger it.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.ref_type == 'branch' && endsWith(github.event.ref, '-stable'))
+
     permissions:
-      contents: read # checkout only; the action performs no git operations
+      contents: write # push the release commit and the v<version> tag
       id-token: write # required for OIDC / npm provenance
 
     concurrency:
@@ -44,15 +55,25 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org/
 
-      - name: Publish release
+      - name: Publish release (manual)
+        if: github.event_name == 'workflow_dispatch'
         uses: software-mansion/npm-package-publish@bbfbcdf3f27e2dc288d7d56f5989a731efc79e6f
         with:
           package-name: '@swmansion/argent-cloud-sdk'
           package-json-path: 'package.json'
           install-dependencies-command: 'npm ci'
+          perform-git-operations: true
           release-type: ${{ inputs.release-type }}
           version: ${{ inputs.version }}
           dry-run: ${{ inputs.dry-run }}
-          # The version bump is made in the PR that ships the change, so the
-          # action has nothing to commit or tag.
-          perform-git-operations: false
+
+      - name: Publish release (stable branch cut)
+        if: github.event_name == 'create'
+        uses: software-mansion/npm-package-publish@bbfbcdf3f27e2dc288d7d56f5989a731efc79e6f
+        with:
+          package-name: '@swmansion/argent-cloud-sdk'
+          package-json-path: 'package.json'
+          install-dependencies-command: 'npm ci'
+          perform-git-operations: true
+          release-type: 'stable'
+          dry-run: false
