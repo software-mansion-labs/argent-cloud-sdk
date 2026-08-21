@@ -1,4 +1,4 @@
-import { ApiError, MoqDirectUnavailableError } from "./errors.js";
+import { ApiError, MoqDirectUnavailableError, SimctlError } from "./errors.js";
 
 /**
  * How a request reaches the control plane. Two shapes exist today:
@@ -68,21 +68,71 @@ export function makeProxyTransport(baseUrl: string, options: TransportOptions = 
   return makeTransport(baseUrl, options);
 }
 
-/** Throws an `ApiError` (or `MoqDirectUnavailableError` on 409) for a failed response. */
+/** Decode a base64 string from the wire into its bytes. */
+function fromBase64(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * Throws for a failed response: `SimctlError` when the body carries a simctl
+ * run, `MoqDirectUnavailableError` for the routine 409 on the direct
+ * endpoints, `ApiError` otherwise.
+ */
 export async function throwForStatus(response: Response, path: string): Promise<never> {
   let message = response.statusText || `HTTP ${response.status}`;
   let code: string | undefined;
+  let command: string | undefined;
+  let simctl: { exit_code?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
   try {
-    const body = (await response.json()) as { error?: unknown; code?: unknown };
+    const body = (await response.json()) as {
+      error?: unknown;
+      code?: unknown;
+      command?: unknown;
+      simctl?: unknown;
+    };
     if (typeof body.error === "string") message = body.error;
     if (typeof body.code === "string") code = body.code;
+    if (typeof body.command === "string") command = body.command;
+    if (body.simctl && typeof body.simctl === "object") {
+      simctl = body.simctl as typeof simctl;
+    }
   } catch {
     // Not every error body is JSON — fall back to the status text.
+  }
+  // Since protocol v2 a simctl that ran and refused carries its exit code and
+  // both streams (base64) beside the message, so a caller standing in for
+  // `xcrun simctl` can reproduce them.
+  if (simctl && typeof simctl.exit_code === "number") {
+    throw new SimctlError(response.status, message, {
+      code,
+      command,
+      exitCode: simctl.exit_code,
+      stdout: typeof simctl.stdout === "string" ? fromBase64(simctl.stdout) : new Uint8Array(0),
+      stderr: typeof simctl.stderr === "string" ? fromBase64(simctl.stderr) : new Uint8Array(0),
+    });
   }
   if (response.status === 409 && /\/(moq\/direct|direct)$/.test(path)) {
     throw new MoqDirectUnavailableError(response.status, message, code);
   }
   throw new ApiError(response.status, message, code);
+}
+
+/**
+ * Performs a request and returns the raw `Response`, for the endpoints whose
+ * body is a live stream (`POST /builds`) or whose headers carry part of the
+ * answer. Still throws for a non-2xx status.
+ */
+export async function requestRaw(
+  transport: HttpTransport,
+  path: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const response = await transport.request(path, init);
+  if (!response.ok) await throwForStatus(response, path);
+  return response;
 }
 
 /** Performs a request and parses a JSON body; returns `undefined` for an empty one. */

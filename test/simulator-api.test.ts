@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, MoqDirectUnavailableError } from "../src/http/errors.js";
-import { RouterAuthClient } from "../src/http/router-client.js";
+import {
+  ApiError,
+  MoqDirectUnavailableError,
+  ProtocolVersionMismatchError,
+  SimctlError,
+} from "../src/http/errors.js";
+import { RouterAuthClient, assertProtocolVersion } from "../src/http/router-client.js";
+import { PROTOCOL_VERSION } from "../src/types.js";
 import { SimulatorApi } from "../src/http/simulator-api.js";
 import { makeBearerTransport, makeProxyTransport } from "../src/http/transport.js";
 
@@ -97,6 +103,36 @@ describe("errors", () => {
     await expect(api.direct()).rejects.toBeInstanceOf(MoqDirectUnavailableError);
   });
 
+  it("raises SimctlError carrying the exit code and raw streams", async () => {
+    const { fetchImpl } = stubFetch(() =>
+      json(
+        {
+          error: "Invalid device: NOPE",
+          code: "simctl",
+          command: "boot",
+          simctl: {
+            exit_code: 164,
+            stdout: "",
+            // "boom\n" — bytes, not text: base64 on the wire.
+            stderr: "Ym9vbQo=",
+          },
+        },
+        400,
+      ),
+    );
+    const api = new SimulatorApi(makeProxyTransport("/api", { fetch: fetchImpl }));
+
+    const error = await api.boot("NOPE").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SimctlError);
+    const simctl = error as SimctlError;
+    expect(simctl.status).toBe(400);
+    expect(simctl.code).toBe("simctl");
+    expect(simctl.command).toBe("boot");
+    expect(simctl.exitCode).toBe(164);
+    expect(new TextDecoder().decode(simctl.stderr)).toBe("boom\n");
+    expect(simctl.stdout).toHaveLength(0);
+  });
+
   it("keeps a plain ApiError for a 409 elsewhere", async () => {
     const { fetchImpl } = stubFetch(() => json({ error: "already recording" }, 409));
     const api = new SimulatorApi(makeProxyTransport("/api", { fetch: fetchImpl }));
@@ -140,9 +176,11 @@ describe("endpoints", () => {
     expect(JSON.parse(String(last()?.init?.body))).toEqual({ x: 0.5, y: 0.25 });
   });
 
-  it("defaults launch args to an empty array", async () => {
-    await api.launch("UDID", { app_id: "com.example.app" });
-    expect(JSON.parse(String(last()?.init?.body))).toEqual({ app_id: "com.example.app", args: [] });
+  it("names the install part `app`, which the router checks", async () => {
+    await api.install("UDID", new Uint8Array([1, 2, 3]));
+    const form = last()?.init?.body as FormData;
+    expect(form.get("app")).toBeInstanceOf(Blob);
+    expect(form.get("archive")).toBeNull();
   });
 
   it("posts env pairs and simctl args", async () => {
@@ -151,6 +189,35 @@ describe("endpoints", () => {
     await api.simctl(["list", "devices"]);
     expect(last()?.url).toBe("/api/simctl");
     expect(JSON.parse(String(last()?.init?.body))).toEqual({ args: ["list", "devices"] });
+  });
+
+  it("sends the staged simctl descriptor and tar", async () => {
+    await api.simctlStaged({
+      args: ["addmedia", "UDID", "/tmp/a.png"],
+      staged: [2],
+      files: new Uint8Array([1]),
+    });
+    expect(last()?.url).toBe("/api/simctl/staged");
+    const form = last()?.init?.body as FormData;
+    expect(JSON.parse(String(form.get("descriptor")))).toEqual({
+      args: ["addmedia", "UDID", "/tmp/a.png"],
+      staged: [2],
+    });
+    expect(form.get("files")).toBeInstanceOf(Blob);
+  });
+
+  it("queries the app container by bundle id", async () => {
+    await api.appContainer("UDID", { bundle_id: "com.example.app" });
+    expect(last()?.url).toBe("/api/simulators/UDID/app-container?bundle_id=com.example.app");
+    await api.appContainer("UDID", { bundle_id: "com.example.app", container: "data" });
+    expect(last()?.url).toBe(
+      "/api/simulators/UDID/app-container?bundle_id=com.example.app&container=data",
+    );
+  });
+
+  it("reads the plain-QUIC relay endpoint", async () => {
+    await api.quicInfo("UDID");
+    expect(last()?.url).toBe("/api/simulators/UDID/quic");
   });
 
   it("sends the spawn descriptor as multipart", async () => {
@@ -229,5 +296,24 @@ describe("RouterAuthClient", () => {
 
     await expect(auth.version()).resolves.toEqual({ protocol_version: 3 });
     expect(calls[0]?.url).toBe("https://router.example/version");
+  });
+
+  it("accepts a router on this build's protocol and rejects any other", async () => {
+    expect(() => assertProtocolVersion(PROTOCOL_VERSION)).not.toThrow();
+    expect(() => assertProtocolVersion(PROTOCOL_VERSION - 1)).toThrow(
+      ProtocolVersionMismatchError,
+    );
+  });
+
+  it("asserts the probed version", async () => {
+    const { fetchImpl } = stubFetch(() => json({ protocol_version: PROTOCOL_VERSION + 1 }));
+    const auth = new RouterAuthClient(
+      makeProxyTransport("https://router.example", { fetch: fetchImpl }),
+    );
+
+    const error = await auth.assertProtocolVersion().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ProtocolVersionMismatchError);
+    expect((error as ProtocolVersionMismatchError).actual).toBe(PROTOCOL_VERSION + 1);
+    expect((error as ProtocolVersionMismatchError).expected).toBe(PROTOCOL_VERSION);
   });
 });

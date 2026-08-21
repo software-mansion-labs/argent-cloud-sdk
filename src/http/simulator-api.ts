@@ -1,14 +1,17 @@
 import type {
   AcquireResult,
+  AppContainerOptions,
   DirectEndpoint,
   InjectDylibOptions,
-  LaunchOptions,
   MachinesResult,
   MoqInfo,
+  QuicInfo,
   RecordStartOptions,
   Simulator,
+  SimctlStagedOptions,
   SpawnOptions,
 } from "../types.js";
+import { decodeSpawnStream, type SpawnResult } from "../proto/spawn-stream.js";
 import {
   jsonBody,
   requestBytes,
@@ -101,18 +104,15 @@ export class SimulatorApi {
     return requestVoid(this.transport, `${devicePath(udid)}/tap`, jsonBody({ x, y }));
   }
 
-  launch(udid: string, options: LaunchOptions): Promise<Uint8Array> {
-    return requestBytes(
-      this.transport,
-      `${devicePath(udid)}/launch`,
-      jsonBody({ app_id: options.app_id, args: options.args ?? [] }),
-    );
-  }
-
-  /** Uploads a `.app`/`.ipa` archive. */
+  /**
+   * Uploads a `.app`/`.ipa` archive.
+   *
+   * The part must be named `app`: the router relays it as it arrives and
+   * rejects any other field name rather than buffering to find out.
+   */
   install(udid: string, archive: Uint8Array): Promise<void> {
     const form = new FormData();
-    form.append("archive", new Blob([toArrayBuffer(archive)]), "app.zip");
+    form.append("app", new Blob([toArrayBuffer(archive)]), "app.zip");
     return requestVoid(this.transport, `${devicePath(udid)}/install`, {
       method: "POST",
       body: form,
@@ -120,12 +120,28 @@ export class SimulatorApi {
   }
 
   /**
+   * Fetches an app's container directories as a `.tar.gz`.
+   *
+   * `APP_CONTAINER_MANIFEST` inside the archive names what each entry is —
+   * a data or group container's directory is a bare UUID otherwise.
+   */
+  appContainer(udid: string, options: AppContainerOptions): Promise<Uint8Array> {
+    const query = new URLSearchParams({ bundle_id: options.bundle_id });
+    if (options.container) query.set("container", options.container);
+    return requestBytes(this.transport, `${devicePath(udid)}/app-container?${query}`, {
+      method: "POST",
+    });
+  }
+
+  /**
    * `simctl spawn`. Without `binary`, `args` is the full in-simulator argv;
    * with it, the binary is uploaded first and `args` are its arguments.
-   * Returns the spawn stream (`application/x-sim-spawn-stream`) or, when
-   * detached, an empty body.
+   *
+   * The response is a spawn frame stream, decoded here into the two output
+   * streams and the exit status. A detached spawn answers with an empty body,
+   * so its `exit` is `null`.
    */
-  spawn(udid: string, options: SpawnOptions = {}): Promise<Uint8Array> {
+  async spawn(udid: string, options: SpawnOptions = {}): Promise<SpawnResult> {
     const form = new FormData();
     form.append(
       "descriptor",
@@ -134,10 +150,11 @@ export class SimulatorApi {
     if (options.binary) {
       form.append("binary", new Blob([toArrayBuffer(options.binary)]), "binary");
     }
-    return requestBytes(this.transport, `${devicePath(udid)}/spawn`, {
+    const bytes = await requestBytes(this.transport, `${devicePath(udid)}/spawn`, {
       method: "POST",
       body: form,
     });
+    return decodeSpawnStream(bytes);
   }
 
   injectDylib(udid: string, options: InjectDylibOptions): Promise<void> {
@@ -174,9 +191,37 @@ export class SimulatorApi {
     });
   }
 
-  /** Runs an arbitrary `simctl` command; returns its raw output. */
-  simctl(args: string[]): Promise<Uint8Array> {
-    return requestBytes(this.transport, "/simctl", jsonBody({ args }));
+  /**
+   * Runs an arbitrary `simctl` command.
+   *
+   * Since protocol v2 the passthrough answers with a spawn frame stream, so
+   * stdout and stderr stay separate and the exit code comes back with them. A
+   * non-zero `exit.code` is *not* an error here — the command ran and said no;
+   * only a rejected or unspawnable command rejects the promise.
+   */
+  async simctl(args: string[]): Promise<SpawnResult> {
+    const bytes = await requestBytes(this.transport, "/simctl", jsonBody({ args }));
+    return decodeSpawnStream(bytes);
+  }
+
+  /**
+   * `simctl` passthrough whose file arguments are uploaded alongside it, for
+   * the subcommands that merely *name* local files (`addmedia`,
+   * `install_app_data`, `keychain add-cert`…).
+   *
+   * `files` is a tar archive with each staged file under a directory named for
+   * its index in `args`; the orchestrator extracts it and rewrites those argv
+   * entries to the extracted paths. Same frame-stream reply as `simctl`.
+   */
+  async simctlStaged(options: SimctlStagedOptions): Promise<SpawnResult> {
+    const form = new FormData();
+    form.append("descriptor", JSON.stringify({ args: options.args, staged: options.staged }));
+    form.append("files", new Blob([toArrayBuffer(options.files)]), "files.tar");
+    const bytes = await requestBytes(this.transport, "/simctl/staged", {
+      method: "POST",
+      body: form,
+    });
+    return decodeSpawnStream(bytes);
   }
 
   // ── Streaming endpoints ────────────────────────────────────────────────────
@@ -193,6 +238,15 @@ export class SimulatorApi {
    */
   moqDirectInfo(udid: string): Promise<MoqInfo> {
     return requestJson(this.transport, `${devicePath(udid)}/moq/direct`);
+  }
+
+  /**
+   * The router's plain-QUIC relay for this device — the non-WebTransport path
+   * used by native tooling. Unlike `moqInfo` it carries no token; the relay
+   * URL's own path segment is the credential.
+   */
+  quicInfo(udid: string): Promise<QuicInfo> {
+    return requestJson(this.transport, `${devicePath(udid)}/quic`);
   }
 }
 
