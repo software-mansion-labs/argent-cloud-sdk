@@ -3,7 +3,11 @@
 Client library for Argent Cloud. It covers the two things every
 client needs — the control plane (router's HTTP API) and the device plane
 (MoQ video, input and screenshots) — so headless and interactive clients share
-one implementation instead of each keeping its own copy.
+one implementation instead of each keeping its own copy. Remote builds live
+alongside them in `BuildsApi`.
+
+The control plane tracks a versioned wire protocol; this release speaks
+`PROTOCOL_VERSION` 2.
 
 Used by the Argent Cloud webui and by the `@swmansion/argent` package.
 
@@ -41,7 +45,57 @@ Behind a session-owning proxy — the webui's Rust binary, say — swap in
 `makeProxyTransport("/api")` and skip the auth and session calls entirely.
 
 Failures throw `ApiError` carrying the router's stable `code`; use `isRetryable`
-to spot a `machine_unavailable` you can wait out.
+to spot a `machine_unavailable` you can wait out. A `simctl` that ran and
+refused throws `SimctlError` instead, carrying its exit code and both raw
+output streams.
+
+### Protocol version
+
+The router's protocol is versioned, and a mismatch is a hard break rather than
+a degraded mode — so check it before issuing anything else:
+
+```ts
+await auth.assertProtocolVersion();          // probes GET /version
+// or, from a login reply you already have:
+assertProtocolVersion(loginResult.protocol_version);
+```
+
+### Running simctl
+
+`simctl` and `spawn` answer with a frame stream, so stdout and stderr stay
+separate and the exit status comes back with them. A non-zero exit is a
+*successful* call — the command ran and said no:
+
+```ts
+const { stdout, exit } = await api.simctl(["list", "devices", "--json"]);
+if (exit?.code !== 0) throw new Error("simctl refused");
+const devices = JSON.parse(new TextDecoder().decode(stdout));
+```
+
+Subcommands that name local files (`addmedia`, `install_app_data`, `keychain
+add-cert`) need those files uploaded with them — `simctlStaged` takes a tar of
+them plus the argv indices they occupy. Building the tar is yours; the SDK
+ships no tar writer.
+
+## Builds
+
+`BuildsApi` submits a project tarball for a remote `xcodebuild` run. The submit
+response *is* the log stream, and the build id arrives with the headers, so
+status and cancellation are available while logs are still arriving:
+
+```ts
+import { BuildsApi } from "@swmansion/argent-cloud-sdk";
+
+const builds = new BuildsApi(makeBearerTransport(routerUrl, token));
+const { buildId, frames } = await builds.submit(descriptor, sourceTarGz);
+
+for await (const frame of frames) {
+  if (frame.kind === "result") console.log(frame.result);
+  else process.stdout.write(frame.bytes);
+}
+
+await builds.installBuilt(buildId, udid);
+```
 
 ## Device plane
 
