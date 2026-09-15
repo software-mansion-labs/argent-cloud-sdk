@@ -34,10 +34,20 @@ export function attachVideo(
     name: Path.from(SERVER_BROADCAST),
     catalogFormat: "hang",
     enabled: true,
+    // Subscribe blind rather than waiting for an ANNOUNCE: simulator-server
+    // publishes its broadcast before any client connects, and this is how the
+    // pre-0.5 @moq/watch behaved.
+    reload: false,
   });
 
-  const sync = new Sync({ latency: options.latency ?? "real-time" });
-  const source = new Video.Source({ broadcast });
+  // `supported` is what fills the rendition list; without it Source never
+  // picks a track and the decoder has nothing to subscribe to.
+  const source = new Video.Source({ broadcast, supported: Video.Decoder.supported });
+  const sync = new Sync({
+    connection,
+    latency: options.latency ?? "real-time",
+    video: source.out.jitter,
+  });
   const decoder = new Video.Decoder(source, sync, { enabled: true });
   // "always": the device stream is the whole point of the page, so never let
   // an IntersectionObserver pause it while the canvas is briefly off-screen.
