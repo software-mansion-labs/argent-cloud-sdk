@@ -1,14 +1,14 @@
-import type { Track } from "@moq/net";
+import type { Group, Track } from "@moq/net";
 import { describe, expect, it } from "vitest";
 
 import { ScreenshotChannel } from "../src/moq/screenshot.js";
 
-/** A `Track` stand-in whose frames are pushed by the test. */
+/** A `Track.Subscriber` stand-in whose frames are pushed by the test. */
 class FakeTrack {
-  private readonly queue: Uint8Array[] = [];
-  private waiter: ((frame: Uint8Array | undefined) => void) | null = null;
+  private readonly queue: Group.Frame[] = [];
+  private waiter: ((frame: Group.Frame | undefined) => void) | null = null;
 
-  readFrame(): Promise<Uint8Array | undefined> {
+  readFrame(): Promise<Group.Frame | undefined> {
     const next = this.queue.shift();
     if (next) return Promise.resolve(next);
     return new Promise((resolve) => {
@@ -31,7 +31,9 @@ class FakeTrack {
     if (waiter) waiter(undefined);
   }
 
-  private deliver(frame: Uint8Array): void {
+  private deliver(payload: Uint8Array): void {
+    // The channel only reads the payload; the timestamp is irrelevant to it.
+    const frame = { payload } as Group.Frame;
     const waiter = this.waiter;
     if (waiter) {
       this.waiter = null;
@@ -41,8 +43,8 @@ class FakeTrack {
     this.queue.push(frame);
   }
 
-  asTrack(): Track {
-    return this as unknown as Track;
+  asTrack(): Track.Subscriber {
+    return this as unknown as Track.Subscriber;
   }
 }
 

@@ -44,7 +44,7 @@ export class ScreenshotChannel {
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
-    private readonly track: Track,
+    private readonly track: Track.Subscriber,
     private readonly sendControl: (payload: Uint8Array) => Promise<void>,
     private readonly timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
   ) {}
@@ -125,7 +125,7 @@ export class ScreenshotChannel {
             this.close(new Error("MoQ screenshot track closed before frame arrived"));
             return;
           }
-          this.dispatch(frame);
+          this.dispatch(frame.payload);
           if (this.closed) return;
         }
       } catch (err) {

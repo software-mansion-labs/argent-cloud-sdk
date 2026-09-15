@@ -1,4 +1,4 @@
-import { Broadcast, Connection, Path, type Group, type Track } from "@moq/net";
+import { Broadcast, type Connection, type Group, Path, Time, type Track } from "@moq/net";
 
 import {
   encodeInput,
@@ -39,6 +39,15 @@ export const TOUCH_TRACK = "touch";
  */
 const TRACK_FALLBACK_GRACE_MS = 2000;
 
+/**
+ * Wraps a payload as a MoQ frame. Input frames carry no presentation time of
+ * their own — they are events, not media — so they are stamped with "now",
+ * which is what the wire layer wants for control state.
+ */
+function frame(payload: Uint8Array): Group.Frame {
+  return { payload, timestamp: Time.Timestamp.now() };
+}
+
 export interface MoqDeviceSessionOptions {
   /**
    * Path of the broadcast this client publishes its control track on.
@@ -63,19 +72,19 @@ export class MoqDeviceSession {
   /** Resolves when the underlying transport closes, for any reason. */
   readonly closed: Promise<void>;
 
-  private readonly controlBroadcast = new Broadcast();
-  private readonly serverBroadcast: Broadcast;
+  private readonly controlBroadcast = new Broadcast.Producer();
+  private readonly serverBroadcast: Broadcast.Consumer;
   private screenshots: ScreenshotChannel | null = null;
   private disposed = false;
 
   /** Tracks the server has subscribed on our broadcast, filled as requests arrive. */
-  private readonly requestedTracks = new Map<string, Track>();
-  private trackWaiters = new Map<string, ((track: Track | null) => void)[]>();
+  private readonly requestedTracks = new Map<string, Track.Producer>();
+  private trackWaiters = new Map<string, ((track: Track.Producer | null) => void)[]>();
   private requestPumpDone = false;
 
-  private controlTrack: Promise<Track> | null = null;
-  private keysGroup: Promise<Group | null> | null = null;
-  private touchTrack: Promise<Track | null> | null = null;
+  private controlTrack: Promise<Track.Producer> | null = null;
+  private keysGroup: Promise<Group.Producer | null> | null = null;
+  private touchTrack: Promise<Track.Producer | null> | null = null;
   /** Last snapshot applied through the legacy fallback, for diffing. */
   private legacyTouchApplied: TouchPointer[] = [];
 
@@ -97,7 +106,7 @@ export class MoqDeviceSession {
   /** Sends one already-encoded `DataChannelCommand` frame on the control track. */
   async sendControl(payload: Uint8Array): Promise<void> {
     const track = await this.resolveControlTrack();
-    track.writeFrame(payload);
+    track.writeFrame(frame(payload));
   }
 
   /** Encodes and sends an input event on the track appropriate for its type. */
@@ -120,7 +129,7 @@ export class MoqDeviceSession {
   async touchState(pointers: TouchPointer[]): Promise<void> {
     const track = await this.resolveTouchTrack();
     if (track) {
-      track.writeFrame(encodeTouchState(pointers));
+      track.writeFrame(frame(encodeTouchState(pointers)));
       return;
     }
     // Server predates the touch track: convert the snapshot into legacy
@@ -147,7 +156,7 @@ export class MoqDeviceSession {
     const payload = encodeInput({ type: "key", action, code });
     const group = await this.resolveKeysGroup();
     if (group) {
-      group.writeFrame(payload);
+      group.writeFrame(frame(payload));
     } else {
       await this.sendControl(payload);
     }
@@ -176,15 +185,15 @@ export class MoqDeviceSession {
       return Promise.reject(new Error("MoQ session is closed"));
     }
     this.screenshots ??= new ScreenshotChannel(
-      this.serverBroadcast.subscribe(SCREENSHOT_TRACK, 0),
+      this.serverBroadcast.subscribe(SCREENSHOT_TRACK),
       (payload) => this.sendControl(payload),
     );
     return this.screenshots.request(options);
   }
 
   /** Subscribes to a track on the server's broadcast (video, catalog.json). */
-  subscribe(name: string, priority = 0): Track {
-    return this.serverBroadcast.subscribe(name, priority);
+  subscribe(name: string, priority = 0): Track.Subscriber {
+    return this.serverBroadcast.subscribe(name, { priority });
   }
 
   close(): void {
@@ -216,7 +225,9 @@ export class MoqDeviceSession {
       for (;;) {
         const request = await this.controlBroadcast.requested();
         if (!request) break;
-        const { track } = request;
+        // Accepting commits the track and hands back its producer; the
+        // server's subscription stays pending until we do.
+        const track = request.accept();
         this.requestedTracks.set(track.name, track);
         const waiters = this.trackWaiters.get(track.name);
         if (waiters) {
@@ -236,7 +247,7 @@ export class MoqDeviceSession {
   }
 
   /** Resolves once the server subscribes `name`; null if the broadcast closes first. */
-  private waitForTrack(name: string): Promise<Track | null> {
+  private waitForTrack(name: string): Promise<Track.Producer | null> {
     const track = this.requestedTracks.get(name);
     if (track) return Promise.resolve(track);
     if (this.requestPumpDone) return Promise.resolve(null);
@@ -253,10 +264,10 @@ export class MoqDeviceSession {
    * that speaks the split protocol subscribes all tracks together, so waiting
    * longer only means it never will. Null means "fall back to control".
    */
-  private waitForOptionalTrack(name: string): Promise<Track | null> {
+  private waitForOptionalTrack(name: string): Promise<Track.Producer | null> {
     return new Promise((resolve) => {
       let settled = false;
-      const settle = (track: Track | null) => {
+      const settle = (track: Track.Producer | null) => {
         if (!settled) {
           settled = true;
           resolve(track);
@@ -275,7 +286,7 @@ export class MoqDeviceSession {
    * so the first send may have to wait for it. Cache the resolved track so
    * every later send is immediate.
    */
-  private resolveControlTrack(): Promise<Track> {
+  private resolveControlTrack(): Promise<Track.Producer> {
     this.controlTrack ??= this.waitForTrack(CONTROL_TRACK).then((track) => {
       if (!track) {
         throw new Error("MoQ control broadcast closed before the server subscribed");
@@ -286,14 +297,14 @@ export class MoqDeviceSession {
   }
 
   /** The single ordered group all key events ride on; null → legacy fallback. */
-  private resolveKeysGroup(): Promise<Group | null> {
+  private resolveKeysGroup(): Promise<Group.Producer | null> {
     this.keysGroup ??= this.waitForOptionalTrack(KEYS_TRACK).then(
       (track) => track?.appendGroup() ?? null,
     );
     return this.keysGroup;
   }
 
-  private resolveTouchTrack(): Promise<Track | null> {
+  private resolveTouchTrack(): Promise<Track.Producer | null> {
     this.touchTrack ??= this.waitForOptionalTrack(TOUCH_TRACK);
     return this.touchTrack;
   }
