@@ -37,13 +37,15 @@ export function attachVideo(
   });
 
   const sync = new Sync({ latency: options.latency ?? "real-time" });
-  const source = new Video.Source(sync, { broadcast });
-  const decoder = new Video.Decoder(source, { enabled: true });
-  const renderer = new Video.Renderer(decoder, { canvas });
+  const source = new Video.Source({ broadcast });
+  const decoder = new Video.Decoder(source, sync, { enabled: true });
+  // "always": the device stream is the whole point of the page, so never let
+  // an IntersectionObserver pause it while the canvas is briefly off-screen.
+  const renderer = new Video.Renderer(decoder, { canvas, visible: "always" });
 
   let width = 0;
   let height = 0;
-  const stopWatching = decoder.display.changed((display) => {
+  const stopWatching = decoder.out.display.changed((display) => {
     if (!display) return;
     if (display.width === width && display.height === height) return;
     width = display.width;

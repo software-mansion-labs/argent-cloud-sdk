@@ -9,15 +9,15 @@ import { MoqDeviceSession } from "../src/moq/session.js";
  */
 function fakeConnection() {
   const published: { path: string; broadcast: FakeBroadcast }[] = [];
-  const subscribed: { name: string; priority: number }[] = [];
+  const subscribed: { name: string; priority?: number }[] = [];
   let closedResolve: () => void = () => {};
   const closed = new Promise<void>((resolve) => {
     closedResolve = resolve;
   });
 
   const serverBroadcast = {
-    subscribe(name: string, priority: number) {
-      subscribed.push({ name, priority });
+    subscribe(name: string, options?: { priority?: number }) {
+      subscribed.push({ name, priority: options?.priority });
       return { name, readFrame: () => new Promise(() => {}) };
     },
   };
@@ -34,29 +34,39 @@ function fakeConnection() {
   return { connection, published, subscribed, closeConnection: closedResolve };
 }
 
+/** What `Broadcast.Producer.requested()` yields: a request the session accepts. */
+interface FakeRequest {
+  accept(): FakeTrack;
+}
+
 interface FakeBroadcast {
-  requested(): Promise<{ track: FakeTrack } | undefined>;
+  requested(): Promise<FakeRequest | undefined>;
   close(): void;
+}
+
+/** The frame shape `@moq/net` writes: payload plus a presentation timestamp. */
+interface Frame {
+  payload: Uint8Array;
 }
 
 /** A track the fake server has subscribed on the session's broadcast. */
 class FakeTrack {
   readonly frames: Uint8Array[] = [];
-  readonly groups: { frames: Uint8Array[]; writeFrame(f: Uint8Array): void }[] = [];
+  readonly groups: { frames: Uint8Array[]; writeFrame(f: Frame): void }[] = [];
 
   constructor(
     readonly name: string,
     private readonly all: Uint8Array[],
   ) {}
 
-  writeFrame(f: Uint8Array) {
-    this.frames.push(f);
-    this.all.push(f);
+  writeFrame(f: Frame) {
+    this.frames.push(f.payload);
+    this.all.push(f.payload);
   }
 
   appendGroup() {
     const frames: Uint8Array[] = [];
-    const group = { frames, writeFrame: (f: Uint8Array) => frames.push(f) };
+    const group = { frames, writeFrame: (f: Frame) => frames.push(f.payload) };
     this.groups.push(group);
     return group;
   }
@@ -67,13 +77,13 @@ class FakeControlBroadcast implements FakeBroadcast {
   /** Frames written to any track, in send order (legacy assertions). */
   readonly frames: Uint8Array[] = [];
   closed = false;
-  private requests: { track: FakeTrack }[] = [];
-  private waiter: ((r: { track: FakeTrack } | undefined) => void) | null = null;
+  private requests: FakeRequest[] = [];
+  private waiter: ((r: FakeRequest | undefined) => void) | null = null;
 
   requested() {
     const next = this.requests.shift();
     if (next) return Promise.resolve(next);
-    return new Promise<{ track: FakeTrack } | undefined>((resolve) => {
+    return new Promise<FakeRequest | undefined>((resolve) => {
       this.waiter = resolve;
     });
   }
@@ -81,7 +91,7 @@ class FakeControlBroadcast implements FakeBroadcast {
   /** Simulates the server subscribing to a track on our broadcast. */
   serverSubscribes(name: string): FakeTrack {
     const track = new FakeTrack(name, this.frames);
-    const request = { track };
+    const request: FakeRequest = { accept: () => track };
     const waiter = this.waiter;
     if (waiter) {
       this.waiter = null;
@@ -98,12 +108,15 @@ class FakeControlBroadcast implements FakeBroadcast {
 }
 
 vi.mock("@moq/net", () => ({
-  Broadcast: class {
-    constructor() {
-      return controlBroadcast;
-    }
+  Broadcast: {
+    Producer: class {
+      constructor() {
+        return controlBroadcast;
+      }
+    },
   },
   Path: { from: (p: string) => p },
+  Time: { Timestamp: { now: () => 0 } },
   Connection: {},
 }));
 
@@ -168,7 +181,8 @@ describe("MoqDeviceSession", () => {
     expect(subscribed).toHaveLength(0);
 
     void session.screenshot().catch(() => {});
-    expect(subscribed).toEqual([{ name: "screenshot", priority: 0 }]);
+    // Priority defaults inside @moq/net now, so only the name is ours to assert.
+    expect(subscribed.map((s) => s.name)).toEqual(["screenshot"]);
   });
 
   it("closes the control broadcast and the connection", () => {
