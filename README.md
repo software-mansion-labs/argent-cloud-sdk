@@ -72,6 +72,10 @@ if (exit?.code !== 0) throw new Error("simctl refused");
 const devices = JSON.parse(new TextDecoder().decode(stdout));
 ```
 
+`simctl(["spawn", udid, ...argv])` runs as `spawn(udid, { args: argv })`, so a
+ported `xcrun simctl spawn` keeps working; use `spawn` directly to upload the
+binary to run or to detach it.
+
 Subcommands that name local files (`addmedia`, `install_app_data`, `keychain
 add-cert`) need those files uploaded with them — `simctlStaged` takes a tar of
 them plus the argv indices they occupy. Building the tar is yours; the SDK

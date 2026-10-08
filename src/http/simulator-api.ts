@@ -198,8 +198,15 @@ export class SimulatorApi {
    * stdout and stderr stay separate and the exit code comes back with them. A
    * non-zero `exit.code` is *not* an error here — the command ran and said no;
    * only a rejected or unspawnable command rejects the promise.
+   *
+   * `simctl spawn <udid> <argv…>` is sent as {@link spawn}, since the
+   * passthrough refuses it; simctl's own `-w`/`-s` options are rejected.
    */
   async simctl(args: string[]): Promise<SpawnResult> {
+    if (args[0] === "spawn") {
+      const [udid, ...argv] = spawnTarget(args.slice(1));
+      return this.spawn(udid, { args: argv });
+    }
     const bytes = await requestBytes(this.transport, "/simctl", jsonBody({ args }));
     return decodeSpawnStream(bytes);
   }
@@ -252,6 +259,18 @@ export class SimulatorApi {
 
 function devicePath(udid: string): string {
   return `/simulators/${encodeURIComponent(udid)}`;
+}
+
+/** The device and in-simulator argv after `simctl spawn`. */
+function spawnTarget(rest: string[]): [string, ...string[]] {
+  const [udid, ...argv] = rest;
+  if (udid === undefined || argv.length === 0) {
+    throw new Error("simctl spawn takes a device and a command: spawn <udid> <command> [<argv>…]");
+  }
+  if (udid.startsWith("-")) {
+    throw new Error(`simctl spawn option ${udid} is not supported; pass the device first`);
+  }
+  return [udid, ...argv];
 }
 
 /** `Blob` needs a real ArrayBuffer; a typed array may be a view into a larger one. */

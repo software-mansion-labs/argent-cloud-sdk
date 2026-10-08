@@ -220,6 +220,23 @@ describe("endpoints", () => {
     expect(last()?.url).toBe("/api/simulators/UDID/quic");
   });
 
+  it("routes `simctl spawn` onto the spawn endpoint", async () => {
+    await api.simctl(["spawn", "UDID", "launchctl", "list"]);
+    expect(last()?.url).toBe("/api/simulators/UDID/spawn");
+    const form = last()?.init?.body as FormData;
+    expect(JSON.parse(String(form.get("descriptor")))).toEqual({
+      args: ["launchctl", "list"],
+      detach: false,
+    });
+    expect(form.get("binary")).toBeNull();
+  });
+
+  it("rejects `simctl spawn` forms the spawn endpoint cannot express", async () => {
+    await expect(api.simctl(["spawn", "-s", "UDID", "launchctl"])).rejects.toThrow("-s");
+    await expect(api.simctl(["spawn", "UDID"])).rejects.toThrow("spawn <udid> <command>");
+    await expect(api.simctl(["spawn"])).rejects.toThrow("spawn <udid> <command>");
+  });
+
   it("sends the spawn descriptor as multipart", async () => {
     await api.spawn("UDID", { args: ["--flag"], detach: true });
     const form = last()?.init?.body as FormData;
