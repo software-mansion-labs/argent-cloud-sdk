@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { MoqDeviceSession } from "../src/moq/session.js";
+import { encodeInput } from "../src/proto/encoder.js";
 
 /**
  * Stands in for the pieces of `@moq/net` a session touches: a published
@@ -147,17 +148,18 @@ describe("MoqDeviceSession", () => {
     const { session, control } = newSession();
 
     const sent = session.button("Down", "home");
-    expect(control.frames).toHaveLength(0);
-
     control.serverSubscribes("control");
+    const keys = control.serverSubscribes("keys");
+    expect(keys.groups).toHaveLength(0);
+
     await sent;
-    expect(control.frames).toHaveLength(1);
+    expect(keys.groups[0]?.frames).toHaveLength(1);
   });
 
   it("ignores subscriptions to tracks other than 'control'", async () => {
     const { session, control } = newSession();
 
-    const sent = session.rotate("LandscapeLeft");
+    const sent = session.sendControl(new Uint8Array([1]));
     control.serverSubscribes("something-else");
     control.serverSubscribes("control");
     await sent;
@@ -168,10 +170,10 @@ describe("MoqDeviceSession", () => {
   it("resolves the control track once and reuses it", async () => {
     const { session, control } = newSession();
 
-    const first = session.touch("Down", 0.5, 0.5);
+    const first = session.sendControl(new Uint8Array([1]));
     control.serverSubscribes("control");
     await first;
-    await session.touch("Up", 0.5, 0.5);
+    await session.sendControl(new Uint8Array([2]));
 
     expect(control.frames).toHaveLength(2);
   });
@@ -216,22 +218,44 @@ describe("MoqDeviceSession", () => {
     await expect(pending).rejects.toThrow(/connection closed/i);
   });
 
-  it("sends all key events as frames of one group on the keys track", async () => {
+  it("sends key, touch, button, rotate and wheel events as frames of one ordered group, in call order", async () => {
     const { session, control } = newSession();
 
     const first = session.key("Down", 0x04);
-    control.serverSubscribes("control");
+    const controlTrack = control.serverSubscribes("control");
     const keys = control.serverSubscribes("keys");
     await first;
-    await session.key("Up", 0x04);
-    await session.key("Down", 0x05);
+    await session.touch("Down", 0.5, 0.5);
+    await session.touch("Up", 0.5, 0.5);
+    await session.button("Down", "home");
+    await session.rotate("LandscapeLeft");
+    await session.wheel(0.5, 0.5, 0, 1);
 
     expect(keys.groups).toHaveLength(1);
-    expect(keys.groups[0]?.frames).toHaveLength(3);
-    expect(control.serverSubscribes("control").frames).toHaveLength(0);
+    expect(keys.groups[0]?.frames).toEqual([
+      encodeInput({ type: "key", action: "Down", code: 0x04 }),
+      encodeInput({ type: "touch", action: "Down", x: 0.5, y: 0.5 }),
+      encodeInput({ type: "touch", action: "Up", x: 0.5, y: 0.5 }),
+      encodeInput({ type: "button", action: "Down", button: "home" }),
+      encodeInput({ type: "rotate", direction: "LandscapeLeft" }),
+      encodeInput({ type: "wheel", x: 0.5, y: 0.5, dx: 0, dy: 1 }),
+    ]);
+    expect(controlTrack.frames).toHaveLength(0);
   });
 
-  it("falls back to control-track key frames when the server never subscribes 'keys'", async () => {
+  it("sends screenshot requests on the control track, not the ordered group", async () => {
+    const { session, control } = newSession();
+
+    const sent = session.sendInput({ type: "screenshot", id: "s1" });
+    const controlTrack = control.serverSubscribes("control");
+    const keys = control.serverSubscribes("keys");
+    await sent;
+
+    expect(controlTrack.frames).toHaveLength(1);
+    expect(keys.groups).toHaveLength(0);
+  });
+
+  it("falls back to control-track frames when the server never subscribes 'keys'", async () => {
     vi.useFakeTimers();
     try {
       const { session, control } = newSession();
@@ -240,8 +264,10 @@ describe("MoqDeviceSession", () => {
       const controlTrack = control.serverSubscribes("control");
       await vi.advanceTimersByTimeAsync(2500);
       await sent;
+      await session.touch("Down", 0.5, 0.5);
+      await session.button("Up", "home");
 
-      expect(controlTrack.frames).toHaveLength(1);
+      expect(controlTrack.frames).toHaveLength(3);
     } finally {
       vi.useRealTimers();
     }
