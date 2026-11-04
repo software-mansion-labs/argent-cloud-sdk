@@ -15,30 +15,15 @@ import { ScreenshotChannel, type ScreenshotOptions } from "./screenshot.js";
 
 /** The broadcast simulator-server publishes: catalog, video and screenshot tracks. */
 export const SERVER_BROADCAST = "simulator";
-/**
- * One group per frame, read latest-wins: a frame overtaken in transit by a
- * newer one is dropped. Carries screenshot requests and wheel deltas, and every
- * event against a server that predates the keys/touch tracks.
- */
+/** One group per frame, read latest-wins: a frame overtaken in transit is dropped. */
 export const CONTROL_TRACK = "control";
 const SCREENSHOT_TRACK = "screenshot";
-/**
- * Key, touch, button and rotate events in one long-lived group: an ordered,
- * reliable QUIC stream, so a Down is never overtaken or dropped before its Up.
- * Named for the first event type that moved here; the server applies any
- * command it reads off this track.
- */
+/** One long-lived group, read in order. Named for the first event type that moved here. */
 export const KEYS_TRACK = "keys";
-/**
- * Touch state snapshots, one group per frame, latest-wins: the server diffs
- * consecutive snapshots, so only the newest matters.
- */
+/** Touch-state snapshots, one group per frame, latest-wins: the server diffs consecutive ones. */
 export const TOUCH_TRACK = "touch";
 
-/**
- * How long after the control subscription to wait for the keys/touch
- * subscriptions before treating the server as one that predates them.
- */
+/** Wait this long after the control subscription for keys/touch before assuming an older server. */
 const TRACK_FALLBACK_GRACE_MS = 2000;
 
 /**
@@ -85,9 +70,8 @@ export class MoqDeviceSession {
   private requestPumpDone = false;
 
   private controlTrack: Promise<Track.Producer> | null = null;
-  private graceElapsed: Promise<void> | null = null;
-  private graceOver = false;
-  private orderedGroup: Group.Producer | null = null;
+  private orderedGroup: Promise<Group.Producer | null> | null = null;
+  private touchTrack: Promise<Track.Producer | null> | null = null;
   /** Last snapshot applied through the legacy fallback, for diffing. */
   private legacyTouchApplied: TouchPointer[] = [];
 
@@ -106,18 +90,16 @@ export class MoqDeviceSession {
     );
   }
 
-  /** Sends one already-encoded `DataChannelCommand` frame on the latest-wins control track. */
+  /** Sends one already-encoded `DataChannelCommand` frame on the control track. */
   async sendControl(payload: Uint8Array): Promise<void> {
     const track = await this.resolveControlTrack();
     track.writeFrame(frame(payload));
   }
 
   /**
-   * Encodes and sends an input event on the track for its type: snapshots on
-   * "touch", screenshot requests and wheel deltas on "control", key, touch,
-   * button and rotate in order on the "keys" group. The tracks have no
-   * ordering relative to each other, so do not mix `touchState` and `touch`
-   * within one gesture.
+   * Snapshots go to "touch", screenshot and wheel to "control", everything with
+   * a Down/Up pair to the ordered "keys" group. Tracks are unordered relative to
+   * each other, so do not mix `touchState` and `touch` within one gesture.
    */
   sendInput(message: InputMessage): Promise<void> {
     switch (message.type) {
@@ -126,26 +108,30 @@ export class MoqDeviceSession {
       case "screenshot":
       case "wheel":
         return this.sendControl(encodeInput(message));
-      default:
+      case "key":
+      case "touch":
+      case "button":
+      case "rotate":
         return this.sendOrdered(encodeInput(message));
+      default: {
+        const unreachable: never = message;
+        throw new Error(`unknown input message ${JSON.stringify(unreachable)}`);
+      }
     }
   }
 
-  /**
-   * Sends a full snapshot of the active touch pointers on the latest-wins
-   * "touch" track. Right for interactive gestures; use `touch` for programmatic
-   * taps, which must not lose a Down to its Up.
-   */
+  /** Full snapshot of the active pointers. For interactive gestures; programmatic taps use `touch`. */
   async touchState(pointers: TouchPointer[]): Promise<void> {
-    const track = await this.waitForOptionalTrack(TOUCH_TRACK);
+    const track = await this.resolveTouchTrack();
     if (track) {
       track.writeFrame(frame(encodeTouchState(pointers)));
       return;
     }
+    // A server without "touch" predates "keys" too (both arrived together).
     const { events, applied } = diffTouchStates(this.legacyTouchApplied, pointers);
     this.legacyTouchApplied = applied;
     for (const message of events) {
-      await this.sendInput(message);
+      await this.sendControl(encodeInput(message));
     }
   }
 
@@ -157,20 +143,14 @@ export class MoqDeviceSession {
     return this.sendInput({ type: "key", action, code });
   }
 
-  /** Writes to the ordered group, or to the control track against a server without "keys". */
+  /** Ordered group, or the control track against a server without "keys". */
   private async sendOrdered(payload: Uint8Array): Promise<void> {
-    const track = await this.waitForOptionalTrack(KEYS_TRACK);
-    if (!track) {
+    const group = await this.resolveOrderedGroup();
+    if (group) {
+      group.writeFrame(frame(payload));
+    } else {
       await this.sendControl(payload);
-      return;
     }
-    // The wire layer drops its reader of the group after a stream reset or once
-    // it lagged past the frame cache; `used` falls with it, so start a new group
-    // rather than writing into one nobody reads.
-    if (!this.orderedGroup?.used.peek()) {
-      this.orderedGroup = track.appendGroup();
-    }
-    this.orderedGroup.writeFrame(frame(payload));
   }
 
   button(action: KeyActionName, button: ButtonName): Promise<void> {
@@ -270,25 +250,25 @@ export class MoqDeviceSession {
   }
 
   /**
-   * Resolves `name` once the server subscribes it, or null once the grace
-   * period since the control subscription has passed without it. The grace
-   * period runs once per session; after it each call is a plain lookup, so a
-   * late subscription is still picked up.
+   * The track once the server subscribes it, or null if it has not within the
+   * grace period after the control subscription: a server that speaks the split
+   * protocol subscribes all tracks together.
    */
   private waitForOptionalTrack(name: string): Promise<Track.Producer | null> {
-    if (this.graceOver) return Promise.resolve(this.requestedTracks.get(name) ?? null);
-    this.graceElapsed ??= this.resolveControlTrack()
-      .then(
-        () => new Promise<void>((resolve) => setTimeout(resolve, TRACK_FALLBACK_GRACE_MS)),
-        () => undefined,
-      )
-      .then(() => {
-        this.graceOver = true;
-      });
-    return Promise.race([
-      this.waitForTrack(name),
-      this.graceElapsed.then(() => this.requestedTracks.get(name) ?? null),
-    ]);
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (track: Track.Producer | null) => {
+        if (!settled) {
+          settled = true;
+          resolve(track);
+        }
+      };
+      void this.waitForTrack(name).then(settle);
+      void this.resolveControlTrack().then(
+        () => setTimeout(() => settle(this.requestedTracks.get(name) ?? null), TRACK_FALLBACK_GRACE_MS),
+        () => settle(null),
+      );
+    });
   }
 
   /**
@@ -304,5 +284,21 @@ export class MoqDeviceSession {
       return track;
     });
     return this.controlTrack;
+  }
+
+  /**
+   * The one group every ordered send awaits, so call order is write order. A
+   * reader the wire layer drops mid-session (stream reset) is not recovered.
+   */
+  private resolveOrderedGroup(): Promise<Group.Producer | null> {
+    this.orderedGroup ??= this.waitForOptionalTrack(KEYS_TRACK).then(
+      (track) => track?.appendGroup() ?? null,
+    );
+    return this.orderedGroup;
+  }
+
+  private resolveTouchTrack(): Promise<Track.Producer | null> {
+    this.touchTrack ??= this.waitForOptionalTrack(TOUCH_TRACK);
+    return this.touchTrack;
   }
 }

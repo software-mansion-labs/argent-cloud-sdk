@@ -50,10 +50,8 @@ interface Frame {
   payload: Uint8Array;
 }
 
-/** A group with the server's reader attached (`used`) until a test detaches it. */
 interface FakeGroup {
   frames: Uint8Array[];
-  used: { value: boolean; peek(): boolean };
   writeFrame(f: Frame): void;
 }
 
@@ -74,13 +72,7 @@ class FakeTrack {
 
   appendGroup(): FakeGroup {
     const frames: Uint8Array[] = [];
-    const used = {
-      value: true,
-      peek() {
-        return this.value;
-      },
-    };
-    const group = { frames, used, writeFrame: (f: Frame) => frames.push(f.payload) };
+    const group = { frames, writeFrame: (f: Frame) => frames.push(f.payload) };
     this.groups.push(group);
     return group;
   }
@@ -157,7 +149,7 @@ describe("MoqDeviceSession", () => {
     expect(published[0]?.path).toBe("argent");
   });
 
-  it("waits for the server to subscribe before sending input", async () => {
+  it("waits for the server to subscribe the ordered track before sending input", async () => {
     const { session, control } = newSession();
 
     const sent = session.button("Down", "home");
@@ -255,7 +247,7 @@ describe("MoqDeviceSession", () => {
     expect(controlTrack.frames).toHaveLength(0);
   });
 
-  it("sends screenshot requests and wheel deltas on the control track, not the ordered group", async () => {
+  it("sends screenshot requests and wheel deltas on the control track", async () => {
     const { session, control } = newSession();
 
     const sent = session.sendInput({ type: "screenshot", id: "s1" });
@@ -268,19 +260,25 @@ describe("MoqDeviceSession", () => {
     expect(keys.groups).toHaveLength(0);
   });
 
-  it("starts a new group once the wire layer stops reading the current one", async () => {
+  it("keeps call order for sends that are not awaited", async () => {
     const { session, control } = newSession();
-
-    const first = session.key("Down", 0x04);
     control.serverSubscribes("control");
     const keys = control.serverSubscribes("keys");
-    await first;
-    await session.key("Up", 0x04);
-    keys.groups[0]!.used.value = false;
-    await session.touch("Down", 0.5, 0.5);
-    await session.touch("Up", 0.5, 0.5);
 
-    expect(keys.groups.map((g) => g.frames.length)).toEqual([2, 2]);
+    await Promise.all([
+      session.key("Down", 0x04),
+      session.touch("Down", 0.5, 0.5),
+      session.touch("Up", 0.5, 0.5),
+      session.key("Up", 0x04),
+    ]);
+
+    expect(keys.groups).toHaveLength(1);
+    expect(keys.groups[0]?.frames).toEqual([
+      encodeInput({ type: "key", action: "Down", code: 0x04 }),
+      encodeInput({ type: "touch", action: "Down", x: 0.5, y: 0.5 }),
+      encodeInput({ type: "touch", action: "Up", x: 0.5, y: 0.5 }),
+      encodeInput({ type: "key", action: "Up", code: 0x04 }),
+    ]);
   });
 
   it("falls back to control-track frames when the server never subscribes 'keys'", async () => {
@@ -297,26 +295,6 @@ describe("MoqDeviceSession", () => {
       await session.rotate("Portrait");
 
       expect(controlTrack.frames).toHaveLength(4);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("uses a 'keys' subscription that arrives after the grace period", async () => {
-    vi.useFakeTimers();
-    try {
-      const { session, control } = newSession();
-
-      const sent = session.key("Down", 0x04);
-      const controlTrack = control.serverSubscribes("control");
-      await vi.advanceTimersByTimeAsync(2500);
-      await sent;
-      const keys = control.serverSubscribes("keys");
-      await vi.advanceTimersByTimeAsync(0);
-      await session.key("Up", 0x04);
-
-      expect(controlTrack.frames).toHaveLength(1);
-      expect(keys.groups[0]?.frames).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
