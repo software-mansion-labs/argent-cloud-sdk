@@ -5,8 +5,9 @@
  * Import from `@swmansion/argent-cloud-sdk/video`.
  */
 import { Path, type Connection } from "@moq/net";
-import { Broadcast as WatchBroadcast, Sync, Video, type Latency } from "@moq/watch";
+import { Broadcast as WatchBroadcast, Video, type Latency } from "@moq/watch";
 
+import { LiveEdgeSync, paintLiveFrames } from "./moq/live-frames.js";
 import { SERVER_BROADCAST } from "./moq/session.js";
 
 export interface AttachVideoOptions {
@@ -43,19 +44,19 @@ export function attachVideo(
   // `supported` is what fills the rendition list; without it Source never
   // picks a track and the decoder has nothing to subscribe to.
   const source = new Video.Source({ broadcast, supported: Video.Decoder.supported });
-  const sync = new Sync({
+  const sync = new LiveEdgeSync({
     connection,
     latency: options.latency ?? "real-time",
     video: source.out.jitter,
   });
   const decoder = new Video.Decoder(source, sync, { enabled: true });
-  // "always": the device stream is the whole point of the page, so never let
-  // an IntersectionObserver pause it while the canvas is briefly off-screen.
-  const renderer = new Video.Renderer(decoder, { canvas, visible: "always" });
+  // Not `Video.Renderer`: it paints every frame the decoder releases, which on
+  // joining a stream replays the group backlog at decode speed.
+  const stopPainting = paintLiveFrames(decoder.out.frame, sync, canvas);
 
   let width = 0;
   let height = 0;
-  const stopWatching = decoder.out.display.changed((display) => {
+  const stopWatching = decoder.out.display.subscribe((display) => {
     if (!display) return;
     if (display.width === width && display.height === height) return;
     width = display.width;
@@ -67,8 +68,8 @@ export function attachVideo(
 
   return {
     close() {
-      stopWatching?.();
-      renderer.close();
+      stopWatching();
+      stopPainting();
       decoder.close();
       source.close();
       sync.close();
