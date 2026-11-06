@@ -25,6 +25,18 @@ export const TOUCH_TRACK = "touch";
 
 /** Wait this long after the control subscription for keys/touch before assuming an older server. */
 const TRACK_FALLBACK_GRACE_MS = 2000;
+/**
+ * Roll the ordered group after this many frames. moq-lite serves a group from a
+ * 1024-frame cache; a reader that falls further behind leaves the group for
+ * good and waits for the next one, so no group may grow near the cap.
+ */
+export const ORDERED_GROUP_FRAMES = 256;
+/**
+ * And only once the group is this old. The server reads groups in arrival
+ * order and skips one whose stream header is overtaken by its successor's, so
+ * a burst must never open two groups back to back.
+ */
+export const ORDERED_GROUP_MIN_AGE_MS = 1000;
 
 /**
  * Wraps a payload as a MoQ frame. Input frames carry no presentation time of
@@ -70,7 +82,10 @@ export class MoqDeviceSession {
   private requestPumpDone = false;
 
   private controlTrack: Promise<Track.Producer> | null = null;
-  private orderedGroup: Promise<Group.Producer | null> | null = null;
+  private orderedTrack: Promise<Track.Producer | null> | null = null;
+  private orderedGroup: Group.Producer | null = null;
+  private orderedGroupFrames = 0;
+  private orderedGroupOpenedAt = 0;
   private touchTrack: Promise<Track.Producer | null> | null = null;
   /** Last snapshot applied through the legacy fallback, for diffing. */
   private legacyTouchApplied: TouchPointer[] = [];
@@ -143,14 +158,30 @@ export class MoqDeviceSession {
     return this.sendInput({ type: "key", action, code });
   }
 
-  /** Ordered group, or the control track against a server without "keys". */
+  /**
+   * The current ordered group, or the control track against a server without
+   * "keys". Every send awaits the same track promise, so call order is write
+   * order; the roll below is synchronous after that await. A reader the wire
+   * layer drops mid-session (stream reset) is not recovered.
+   */
   private async sendOrdered(payload: Uint8Array): Promise<void> {
-    const group = await this.resolveOrderedGroup();
-    if (group) {
-      group.writeFrame(frame(payload));
-    } else {
+    const track = await this.resolveOrderedTrack();
+    if (!track) {
       await this.sendControl(payload);
+      return;
     }
+    const now = Date.now();
+    const due =
+      this.orderedGroupFrames >= ORDERED_GROUP_FRAMES &&
+      now - this.orderedGroupOpenedAt >= ORDERED_GROUP_MIN_AGE_MS;
+    if (!this.orderedGroup || due) {
+      this.orderedGroup?.close();
+      this.orderedGroup = track.appendGroup();
+      this.orderedGroupFrames = 0;
+      this.orderedGroupOpenedAt = now;
+    }
+    this.orderedGroup.writeFrame(frame(payload));
+    this.orderedGroupFrames += 1;
   }
 
   button(action: KeyActionName, button: ButtonName): Promise<void> {
@@ -286,15 +317,9 @@ export class MoqDeviceSession {
     return this.controlTrack;
   }
 
-  /**
-   * The one group every ordered send awaits, so call order is write order. A
-   * reader the wire layer drops mid-session (stream reset) is not recovered.
-   */
-  private resolveOrderedGroup(): Promise<Group.Producer | null> {
-    this.orderedGroup ??= this.waitForOptionalTrack(KEYS_TRACK).then(
-      (track) => track?.appendGroup() ?? null,
-    );
-    return this.orderedGroup;
+  private resolveOrderedTrack(): Promise<Track.Producer | null> {
+    this.orderedTrack ??= this.waitForOptionalTrack(KEYS_TRACK);
+    return this.orderedTrack;
   }
 
   private resolveTouchTrack(): Promise<Track.Producer | null> {
