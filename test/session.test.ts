@@ -293,32 +293,40 @@ describe("MoqDeviceSession", () => {
     ]);
   });
 
-  it("rolls to a new group after ORDERED_GROUP_FRAMES frames once the group is old enough", async () => {
+  it("caps a group at ORDERED_GROUP_FRAMES and opens the next one ORDERED_GROUP_MIN_AGE_MS later", async () => {
     vi.useFakeTimers();
     try {
       const { session, control } = newSession();
       const keyDown = (code: number) => encodeInput({ type: "key", action: "Down", code });
-      const burst = (from: number, count: number) =>
-        Promise.all(Array.from({ length: count }, (_, i) => session.key("Down", from + i)));
-
-      // Sends queued before the server subscribes resolve in call order.
-      const first = burst(0, ORDERED_GROUP_FRAMES + 10);
+      const total = 2 * ORDERED_GROUP_FRAMES + 10;
+      let settled = 0;
+      const all = Promise.all(
+        Array.from({ length: total }, (_, i) => session.key("Down", i).then(() => settled++)),
+      );
       control.serverSubscribes("control");
       const keys = control.serverSubscribes("keys");
-      await first;
-      // A burst past the frame count stays in one group: it is too young to roll.
-      expect(keys.groups).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The burst fills one group and then waits; nothing past the cap is written early.
+      expect(keys.groups.map((g) => g.frames.length)).toEqual([ORDERED_GROUP_FRAMES]);
+      expect(settled).toBe(ORDERED_GROUP_FRAMES);
 
       await vi.advanceTimersByTimeAsync(ORDERED_GROUP_MIN_AGE_MS);
-      await burst(ORDERED_GROUP_FRAMES + 10, 2 * ORDERED_GROUP_FRAMES);
-
       expect(keys.groups.map((g) => g.frames.length)).toEqual([
-        ORDERED_GROUP_FRAMES + 10,
-        2 * ORDERED_GROUP_FRAMES,
+        ORDERED_GROUP_FRAMES,
+        ORDERED_GROUP_FRAMES,
       ]);
-      expect(keys.groups.map((g) => g.closed)).toEqual([true, false]);
+
+      await vi.advanceTimersByTimeAsync(ORDERED_GROUP_MIN_AGE_MS);
+      await all;
+      expect(keys.groups.map((g) => g.frames.length)).toEqual([
+        ORDERED_GROUP_FRAMES,
+        ORDERED_GROUP_FRAMES,
+        10,
+      ]);
+      expect(keys.groups.map((g) => g.closed)).toEqual([true, true, false]);
       expect(keys.groups.flatMap((g) => g.frames)).toEqual(
-        Array.from({ length: 3 * ORDERED_GROUP_FRAMES + 10 }, (_, i) => keyDown(i)),
+        Array.from({ length: total }, (_, i) => keyDown(i)),
       );
     } finally {
       vi.useRealTimers();

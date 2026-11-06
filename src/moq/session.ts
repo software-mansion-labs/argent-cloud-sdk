@@ -26,15 +26,15 @@ export const TOUCH_TRACK = "touch";
 /** Wait this long after the control subscription for keys/touch before assuming an older server. */
 const TRACK_FALLBACK_GRACE_MS = 2000;
 /**
- * Roll the ordered group after this many frames. moq-lite serves a group from a
- * 1024-frame cache; a reader that falls further behind leaves the group for
+ * Roll the ordered group after this many frames. Both ends cache a group's
+ * last 1024 frames; a reader that falls further behind leaves the group for
  * good and waits for the next one, so no group may grow near the cap.
  */
 export const ORDERED_GROUP_FRAMES = 256;
 /**
- * And only once the group is this old. The server reads groups in arrival
- * order and skips one whose stream header is overtaken by its successor's, so
- * a burst must never open two groups back to back.
+ * And only once the group is this old; a fuller group waits. The server reads
+ * groups in arrival order and skips one whose stream header is overtaken by
+ * its successor's, so a burst must never open two groups back to back.
  */
 export const ORDERED_GROUP_MIN_AGE_MS = 1000;
 
@@ -86,6 +86,7 @@ export class MoqDeviceSession {
   private orderedGroup: Group.Producer | null = null;
   private orderedGroupFrames = 0;
   private orderedGroupOpenedAt = 0;
+  private orderedQueue: Promise<void> = Promise.resolve();
   private touchTrack: Promise<Track.Producer | null> | null = null;
   /** Last snapshot applied through the legacy fallback, for diffing. */
   private legacyTouchApplied: TouchPointer[] = [];
@@ -116,7 +117,7 @@ export class MoqDeviceSession {
    * a Down/Up pair to the ordered "keys" group. Tracks are unordered relative to
    * each other, so do not mix `touchState` and `touch` within one gesture.
    */
-  sendInput(message: InputMessage): Promise<void> {
+  async sendInput(message: InputMessage): Promise<void> {
     switch (message.type) {
       case "touchState":
         return this.touchState(message.pointers);
@@ -159,26 +160,33 @@ export class MoqDeviceSession {
   }
 
   /**
-   * The current ordered group, or the control track against a server without
-   * "keys". Every send awaits the same track promise, so call order is write
-   * order; the roll below is synchronous after that await. A reader the wire
-   * layer drops mid-session (stream reset) is not recovered.
+   * Writes run one at a time in call order, so a roll that waits for the
+   * group's age holds everything behind it. A reader the wire layer drops
+   * mid-session (stream reset) is not recovered.
    */
-  private async sendOrdered(payload: Uint8Array): Promise<void> {
+  private sendOrdered(payload: Uint8Array): Promise<void> {
+    const send = this.orderedQueue.then(() => this.writeOrdered(payload));
+    this.orderedQueue = send.catch(() => {});
+    return send;
+  }
+
+  /** The current ordered group, or the control track against a server without "keys". */
+  private async writeOrdered(payload: Uint8Array): Promise<void> {
     const track = await this.resolveOrderedTrack();
     if (!track) {
       await this.sendControl(payload);
       return;
     }
-    const now = Date.now();
-    const due =
-      this.orderedGroupFrames >= ORDERED_GROUP_FRAMES &&
-      now - this.orderedGroupOpenedAt >= ORDERED_GROUP_MIN_AGE_MS;
-    if (!this.orderedGroup || due) {
-      this.orderedGroup?.close();
+    if (this.orderedGroup && this.orderedGroupFrames >= ORDERED_GROUP_FRAMES) {
+      const wait = this.orderedGroupOpenedAt + ORDERED_GROUP_MIN_AGE_MS - Date.now();
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+      this.orderedGroup.close();
+      this.orderedGroup = null;
+    }
+    if (!this.orderedGroup) {
       this.orderedGroup = track.appendGroup();
       this.orderedGroupFrames = 0;
-      this.orderedGroupOpenedAt = now;
+      this.orderedGroupOpenedAt = Date.now();
     }
     this.orderedGroup.writeFrame(frame(payload));
     this.orderedGroupFrames += 1;
