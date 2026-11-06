@@ -154,8 +154,12 @@ await installNodeWebTransport();
 
 ## The input protocol
 
-Input is protobuf `DataChannelCommand` on the MoQ `control` track. The encoder
-in `src/proto/encoder.ts` is written by hand rather than generated, so the
+Input is protobuf `DataChannelCommand` frames on three MoQ tracks: `keys` is one
+long-lived ordered group for key, touch, button and rotate events; `touch` and
+`control` are one group per frame, latest-wins, for touch-state snapshots and
+for screenshot requests and wheel deltas. Tracks are not ordered relative to each
+other. Against a server that predates `keys` and `touch`, the first event of
+each kind waits two seconds before it falls back to `control`. The encoder in `src/proto/encoder.ts` is written by hand rather than generated, so the
 browser bundle carries no protobuf runtime. `proto/datachannel.proto` is the
 canonical schema, and `test/encoder.test.ts` checks every encoder branch against
 protobufjs parsing that file — if the schema and the encoder drift apart, the

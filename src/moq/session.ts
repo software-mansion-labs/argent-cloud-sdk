@@ -15,29 +15,28 @@ import { ScreenshotChannel, type ScreenshotOptions } from "./screenshot.js";
 
 /** The broadcast simulator-server publishes: catalog, video and screenshot tracks. */
 export const SERVER_BROADCAST = "simulator";
-/** One-shot commands (button, rotate, wheel, screenshot, legacy touch/key). */
+/** One group per frame, read latest-wins: a frame overtaken in transit is dropped. */
 export const CONTROL_TRACK = "control";
 const SCREENSHOT_TRACK = "screenshot";
-/**
- * Keyboard events. A single long-lived group, so frames ride one ordered,
- * reliable QUIC stream: no reordering and no latest-wins drops — a lost
- * keyDown/keyUp would otherwise mean a missing character or a stuck key.
- */
+/** One long-lived group, read in order. Named for the first event type that moved here. */
 export const KEYS_TRACK = "keys";
-/**
- * Touch state snapshots (`TouchStateCommand`), one group per frame. Latest-wins
- * drops are correct here by design: the server diffs consecutive snapshots, so
- * only the newest state matters.
- */
+/** Touch-state snapshots, one group per frame, latest-wins: the server diffs consecutive ones. */
 export const TOUCH_TRACK = "touch";
 
-/**
- * How long after the server has subscribed to the control track we keep
- * waiting for it to also subscribe the keys/touch tracks. A server predating
- * the split subscribes only "control"; past this grace period we fall back to
- * legacy per-event control frames for keys and touch.
- */
+/** Wait this long after the control subscription for keys/touch before assuming an older server. */
 const TRACK_FALLBACK_GRACE_MS = 2000;
+/**
+ * Roll the ordered group after this many frames. Both ends cache a group's
+ * last 1024 frames; a reader that falls further behind leaves the group for
+ * good and waits for the next one, so no group may grow near the cap.
+ */
+export const ORDERED_GROUP_FRAMES = 256;
+/**
+ * And only once the group is this old; a fuller group waits. The server reads
+ * groups in arrival order and skips one whose stream header is overtaken by
+ * its successor's, so a burst must never open two groups back to back.
+ */
+export const ORDERED_GROUP_MIN_AGE_MS = 1000;
 
 /**
  * Wraps a payload as a MoQ frame. Input frames carry no presentation time of
@@ -83,7 +82,11 @@ export class MoqDeviceSession {
   private requestPumpDone = false;
 
   private controlTrack: Promise<Track.Producer> | null = null;
-  private keysGroup: Promise<Group.Producer | null> | null = null;
+  private orderedTrack: Promise<Track.Producer | null> | null = null;
+  private orderedGroup: Group.Producer | null = null;
+  private orderedGroupFrames = 0;
+  private orderedGroupOpenedAt = 0;
+  private orderedQueue: Promise<void> = Promise.resolve();
   private touchTrack: Promise<Track.Producer | null> | null = null;
   /** Last snapshot applied through the legacy fallback, for diffing. */
   private legacyTouchApplied: TouchPointer[] = [];
@@ -109,31 +112,38 @@ export class MoqDeviceSession {
     track.writeFrame(frame(payload));
   }
 
-  /** Encodes and sends an input event on the track appropriate for its type. */
-  sendInput(message: InputMessage): Promise<void> {
+  /**
+   * Snapshots go to "touch", screenshot and wheel to "control", everything with
+   * a Down/Up pair to the ordered "keys" group. Tracks are unordered relative to
+   * each other, so do not mix `touchState` and `touch` within one gesture.
+   */
+  async sendInput(message: InputMessage): Promise<void> {
     switch (message.type) {
       case "touchState":
         return this.touchState(message.pointers);
-      case "key":
-        return this.key(message.action, message.code);
-      default:
+      case "screenshot":
+      case "wheel":
         return this.sendControl(encodeInput(message));
+      case "key":
+      case "touch":
+      case "button":
+      case "rotate":
+        return this.sendOrdered(encodeInput(message));
+      default: {
+        const unreachable: never = message;
+        throw new Error(`unknown input message ${JSON.stringify(unreachable)}`);
+      }
     }
   }
 
-  /**
-   * Sends a full snapshot of the active touch pointers. Prefer this over
-   * `touch`: snapshots ride the latest-wins "touch" track, where a dropped
-   * intermediate frame cannot lose a down/up transition.
-   */
+  /** Full snapshot of the active pointers. For interactive gestures; programmatic taps use `touch`. */
   async touchState(pointers: TouchPointer[]): Promise<void> {
     const track = await this.resolveTouchTrack();
     if (track) {
       track.writeFrame(frame(encodeTouchState(pointers)));
       return;
     }
-    // Server predates the touch track: convert the snapshot into legacy
-    // per-event touch frames on the control track.
+    // A server without "touch" predates "keys" too (both arrived together).
     const { events, applied } = diffTouchStates(this.legacyTouchApplied, pointers);
     this.legacyTouchApplied = applied;
     for (const message of events) {
@@ -141,25 +151,45 @@ export class MoqDeviceSession {
     }
   }
 
-  /** @deprecated Use `touchState`; per-event touch frames can be dropped in transit. */
   touch(action: TouchActionName, x: number, y: number, secondX?: number, secondY?: number): Promise<void> {
-    return this.sendControl(
-      encodeInput({ type: "touch", action, x, y, secondX, secondY }),
-    );
+    return this.sendInput({ type: "touch", action, x, y, secondX, secondY });
+  }
+
+  key(action: KeyActionName, code: number): Promise<void> {
+    return this.sendInput({ type: "key", action, code });
   }
 
   /**
-   * Sends a key event on the reliable, ordered "keys" track. Falls back to a
-   * legacy control-track frame against servers that predate the track split.
+   * Writes run one at a time in call order, so a roll that waits for the
+   * group's age holds everything behind it. A reader the wire layer drops
+   * mid-session (stream reset) is not recovered.
    */
-  async key(action: KeyActionName, code: number): Promise<void> {
-    const payload = encodeInput({ type: "key", action, code });
-    const group = await this.resolveKeysGroup();
-    if (group) {
-      group.writeFrame(frame(payload));
-    } else {
+  private sendOrdered(payload: Uint8Array): Promise<void> {
+    const send = this.orderedQueue.then(() => this.writeOrdered(payload));
+    this.orderedQueue = send.catch(() => {});
+    return send;
+  }
+
+  /** The current ordered group, or the control track against a server without "keys". */
+  private async writeOrdered(payload: Uint8Array): Promise<void> {
+    const track = await this.resolveOrderedTrack();
+    if (!track) {
       await this.sendControl(payload);
+      return;
     }
+    if (this.orderedGroup && this.orderedGroupFrames >= ORDERED_GROUP_FRAMES) {
+      const wait = this.orderedGroupOpenedAt + ORDERED_GROUP_MIN_AGE_MS - Date.now();
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+      this.orderedGroup.close();
+      this.orderedGroup = null;
+    }
+    if (!this.orderedGroup) {
+      this.orderedGroup = track.appendGroup();
+      this.orderedGroupFrames = 0;
+      this.orderedGroupOpenedAt = Date.now();
+    }
+    this.orderedGroup.writeFrame(frame(payload));
+    this.orderedGroupFrames += 1;
   }
 
   button(action: KeyActionName, button: ButtonName): Promise<void> {
@@ -259,10 +289,9 @@ export class MoqDeviceSession {
   }
 
   /**
-   * Resolves `name` once the server subscribes it, giving up
-   * `TRACK_FALLBACK_GRACE_MS` after the control track was subscribed — a server
-   * that speaks the split protocol subscribes all tracks together, so waiting
-   * longer only means it never will. Null means "fall back to control".
+   * The track once the server subscribes it, or null if it has not within the
+   * grace period after the control subscription: a server that speaks the split
+   * protocol subscribes all tracks together.
    */
   private waitForOptionalTrack(name: string): Promise<Track.Producer | null> {
     return new Promise((resolve) => {
@@ -296,12 +325,9 @@ export class MoqDeviceSession {
     return this.controlTrack;
   }
 
-  /** The single ordered group all key events ride on; null → legacy fallback. */
-  private resolveKeysGroup(): Promise<Group.Producer | null> {
-    this.keysGroup ??= this.waitForOptionalTrack(KEYS_TRACK).then(
-      (track) => track?.appendGroup() ?? null,
-    );
-    return this.keysGroup;
+  private resolveOrderedTrack(): Promise<Track.Producer | null> {
+    this.orderedTrack ??= this.waitForOptionalTrack(KEYS_TRACK);
+    return this.orderedTrack;
   }
 
   private resolveTouchTrack(): Promise<Track.Producer | null> {

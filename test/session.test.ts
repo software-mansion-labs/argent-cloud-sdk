@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { MoqDeviceSession } from "../src/moq/session.js";
+import { MoqDeviceSession, ORDERED_GROUP_FRAMES, ORDERED_GROUP_MIN_AGE_MS } from "../src/moq/session.js";
+import { encodeInput } from "../src/proto/encoder.js";
 
 /**
  * Stands in for the pieces of `@moq/net` a session touches: a published
@@ -49,10 +50,17 @@ interface Frame {
   payload: Uint8Array;
 }
 
+interface FakeGroup {
+  frames: Uint8Array[];
+  closed: boolean;
+  writeFrame(f: Frame): void;
+  close(): void;
+}
+
 /** A track the fake server has subscribed on the session's broadcast. */
 class FakeTrack {
   readonly frames: Uint8Array[] = [];
-  readonly groups: { frames: Uint8Array[]; writeFrame(f: Frame): void }[] = [];
+  readonly groups: FakeGroup[] = [];
 
   constructor(
     readonly name: string,
@@ -64,9 +72,19 @@ class FakeTrack {
     this.all.push(f.payload);
   }
 
-  appendGroup() {
+  appendGroup(): FakeGroup {
     const frames: Uint8Array[] = [];
-    const group = { frames, writeFrame: (f: Frame) => frames.push(f.payload) };
+    const group: FakeGroup = {
+      frames,
+      closed: false,
+      writeFrame: (f: Frame) => {
+        if (group.closed) throw new Error("group is closed");
+        frames.push(f.payload);
+      },
+      close: () => {
+        group.closed = true;
+      },
+    };
     this.groups.push(group);
     return group;
   }
@@ -143,21 +161,23 @@ describe("MoqDeviceSession", () => {
     expect(published[0]?.path).toBe("argent");
   });
 
-  it("waits for the server to subscribe before sending input", async () => {
+  it("waits for the server to subscribe the ordered track before sending input", async () => {
     const { session, control } = newSession();
 
     const sent = session.button("Down", "home");
-    expect(control.frames).toHaveLength(0);
+    const controlTrack = control.serverSubscribes("control");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(controlTrack.frames).toHaveLength(0);
 
-    control.serverSubscribes("control");
+    const keys = control.serverSubscribes("keys");
     await sent;
-    expect(control.frames).toHaveLength(1);
+    expect(keys.groups[0]?.frames).toHaveLength(1);
   });
 
   it("ignores subscriptions to tracks other than 'control'", async () => {
     const { session, control } = newSession();
 
-    const sent = session.rotate("LandscapeLeft");
+    const sent = session.sendControl(new Uint8Array([1]));
     control.serverSubscribes("something-else");
     control.serverSubscribes("control");
     await sent;
@@ -168,10 +188,10 @@ describe("MoqDeviceSession", () => {
   it("resolves the control track once and reuses it", async () => {
     const { session, control } = newSession();
 
-    const first = session.touch("Down", 0.5, 0.5);
+    const first = session.sendControl(new Uint8Array([1]));
     control.serverSubscribes("control");
     await first;
-    await session.touch("Up", 0.5, 0.5);
+    await session.sendControl(new Uint8Array([2]));
 
     expect(control.frames).toHaveLength(2);
   });
@@ -216,22 +236,104 @@ describe("MoqDeviceSession", () => {
     await expect(pending).rejects.toThrow(/connection closed/i);
   });
 
-  it("sends all key events as frames of one group on the keys track", async () => {
+  it("sends key, touch, button and rotate as frames of one ordered group, in call order", async () => {
     const { session, control } = newSession();
 
     const first = session.key("Down", 0x04);
-    control.serverSubscribes("control");
+    const controlTrack = control.serverSubscribes("control");
     const keys = control.serverSubscribes("keys");
     await first;
-    await session.key("Up", 0x04);
-    await session.key("Down", 0x05);
+    await session.touch("Down", 0.5, 0.5);
+    await session.touch("Up", 0.5, 0.5);
+    await session.button("Down", "home");
+    await session.rotate("LandscapeLeft");
 
     expect(keys.groups).toHaveLength(1);
-    expect(keys.groups[0]?.frames).toHaveLength(3);
-    expect(control.serverSubscribes("control").frames).toHaveLength(0);
+    expect(keys.groups[0]?.frames).toEqual([
+      encodeInput({ type: "key", action: "Down", code: 0x04 }),
+      encodeInput({ type: "touch", action: "Down", x: 0.5, y: 0.5 }),
+      encodeInput({ type: "touch", action: "Up", x: 0.5, y: 0.5 }),
+      encodeInput({ type: "button", action: "Down", button: "home" }),
+      encodeInput({ type: "rotate", direction: "LandscapeLeft" }),
+    ]);
+    expect(controlTrack.frames).toHaveLength(0);
   });
 
-  it("falls back to control-track key frames when the server never subscribes 'keys'", async () => {
+  it("sends screenshot requests and wheel deltas on the control track", async () => {
+    const { session, control } = newSession();
+
+    const sent = session.sendInput({ type: "screenshot", id: "s1" });
+    const controlTrack = control.serverSubscribes("control");
+    const keys = control.serverSubscribes("keys");
+    await sent;
+    await session.wheel(0.5, 0.5, 0, 1);
+
+    expect(controlTrack.frames).toHaveLength(2);
+    expect(keys.groups).toHaveLength(0);
+  });
+
+  it("keeps call order for sends that are not awaited", async () => {
+    const { session, control } = newSession();
+    control.serverSubscribes("control");
+    const keys = control.serverSubscribes("keys");
+
+    await Promise.all([
+      session.key("Down", 0x04),
+      session.touch("Down", 0.5, 0.5),
+      session.touch("Up", 0.5, 0.5),
+      session.key("Up", 0x04),
+    ]);
+
+    expect(keys.groups).toHaveLength(1);
+    expect(keys.groups[0]?.frames).toEqual([
+      encodeInput({ type: "key", action: "Down", code: 0x04 }),
+      encodeInput({ type: "touch", action: "Down", x: 0.5, y: 0.5 }),
+      encodeInput({ type: "touch", action: "Up", x: 0.5, y: 0.5 }),
+      encodeInput({ type: "key", action: "Up", code: 0x04 }),
+    ]);
+  });
+
+  it("caps a group at ORDERED_GROUP_FRAMES and opens the next one ORDERED_GROUP_MIN_AGE_MS later", async () => {
+    vi.useFakeTimers();
+    try {
+      const { session, control } = newSession();
+      const keyDown = (code: number) => encodeInput({ type: "key", action: "Down", code });
+      const total = 2 * ORDERED_GROUP_FRAMES + 10;
+      let settled = 0;
+      const all = Promise.all(
+        Array.from({ length: total }, (_, i) => session.key("Down", i).then(() => settled++)),
+      );
+      control.serverSubscribes("control");
+      const keys = control.serverSubscribes("keys");
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The burst fills one group and then waits; nothing past the cap is written early.
+      expect(keys.groups.map((g) => g.frames.length)).toEqual([ORDERED_GROUP_FRAMES]);
+      expect(settled).toBe(ORDERED_GROUP_FRAMES);
+
+      await vi.advanceTimersByTimeAsync(ORDERED_GROUP_MIN_AGE_MS);
+      expect(keys.groups.map((g) => g.frames.length)).toEqual([
+        ORDERED_GROUP_FRAMES,
+        ORDERED_GROUP_FRAMES,
+      ]);
+
+      await vi.advanceTimersByTimeAsync(ORDERED_GROUP_MIN_AGE_MS);
+      await all;
+      expect(keys.groups.map((g) => g.frames.length)).toEqual([
+        ORDERED_GROUP_FRAMES,
+        ORDERED_GROUP_FRAMES,
+        10,
+      ]);
+      expect(keys.groups.map((g) => g.closed)).toEqual([true, true, false]);
+      expect(keys.groups.flatMap((g) => g.frames)).toEqual(
+        Array.from({ length: total }, (_, i) => keyDown(i)),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to control-track frames when the server never subscribes 'keys'", async () => {
     vi.useFakeTimers();
     try {
       const { session, control } = newSession();
@@ -240,8 +342,11 @@ describe("MoqDeviceSession", () => {
       const controlTrack = control.serverSubscribes("control");
       await vi.advanceTimersByTimeAsync(2500);
       await sent;
+      await session.touch("Down", 0.5, 0.5);
+      await session.button("Up", "home");
+      await session.rotate("Portrait");
 
-      expect(controlTrack.frames).toHaveLength(1);
+      expect(controlTrack.frames).toHaveLength(4);
     } finally {
       vi.useRealTimers();
     }
