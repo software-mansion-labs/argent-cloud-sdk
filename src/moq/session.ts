@@ -18,7 +18,7 @@ export const SERVER_BROADCAST = "simulator";
 /** One group per frame, read latest-wins: a frame overtaken in transit is dropped. */
 export const CONTROL_TRACK = "control";
 const SCREENSHOT_TRACK = "screenshot";
-/** One long-lived group, read in order. Named for the first event type that moved here. */
+/** Groups of up to `ORDERED_GROUP_FRAMES`, read in order. Named for the first event type that moved here. */
 export const KEYS_TRACK = "keys";
 /** Touch-state snapshots, one group per frame, latest-wins: the server diffs consecutive ones. */
 export const TOUCH_TRACK = "touch";
@@ -59,8 +59,9 @@ export interface MoqDeviceSessionOptions {
 }
 
 /**
- * A live MoQ session with one device: input goes out on a published control
- * track, video and screenshots come back on the server's broadcast.
+ * A live MoQ session with one device: input goes out on the tracks this
+ * client publishes (`keys`, `touch`, `control`), video and screenshots come
+ * back on the server's broadcast.
  *
  * Retry policy lives with the caller — see `openWithDirectFallback` for opening
  * a connection and `closed` for noticing it went away. For video, pass
@@ -183,6 +184,8 @@ export class MoqDeviceSession {
       this.orderedGroup.close();
       this.orderedGroup = null;
     }
+    // Queued behind a roll, this may run after close(); a group opened now would never be sent.
+    if (this.disposed) throw new Error("MoQ session is closed");
     if (!this.orderedGroup) {
       this.orderedGroup = track.appendGroup();
       this.orderedGroupFrames = 0;

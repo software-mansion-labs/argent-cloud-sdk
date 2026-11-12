@@ -333,6 +333,30 @@ describe("MoqDeviceSession", () => {
     }
   });
 
+  it("rejects a send that was waiting for a roll when the session closes meanwhile", async () => {
+    vi.useFakeTimers();
+    try {
+      const { session, control } = newSession();
+      const burst = Promise.all(
+        Array.from({ length: ORDERED_GROUP_FRAMES }, (_, i) => session.key("Down", i)),
+      );
+      control.serverSubscribes("control");
+      const keys = control.serverSubscribes("keys");
+      await burst;
+      const waiting = session.key("Down", ORDERED_GROUP_FRAMES);
+      waiting.catch(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(keys.groups).toHaveLength(1);
+
+      session.close();
+      await vi.advanceTimersByTimeAsync(ORDERED_GROUP_MIN_AGE_MS);
+      await expect(waiting).rejects.toThrow("MoQ session is closed");
+      expect(keys.groups).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("falls back to control-track frames when the server never subscribes 'keys'", async () => {
     vi.useFakeTimers();
     try {
